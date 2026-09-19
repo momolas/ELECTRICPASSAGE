@@ -1,9 +1,9 @@
 import Testing
 import Foundation
-@testable import SwiftVehicleProtocols
+@testable import VehicleKit
 
-@Suite("SwiftVehicleProtocols Unit Tests")
-struct SwiftVehicleProtocolsTests {
+@Suite("VehicleKit Unit Tests")
+struct VehicleKitTests {
 
     @Test("Hex Parsing & Formatting")
     func testHexParsing() {

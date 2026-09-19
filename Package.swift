@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "SwiftVehicleProtocols",
+    name: "VehicleKit",
     platforms: [
         .iOS(.v18),
         .macOS(.v15),
@@ -10,6 +10,10 @@ let package = Package(
         .watchOS(.v11)
     ],
     products: [
+        .library(
+            name: "VehicleKit",
+            targets: ["VehicleKit"]
+        ),
         .library(
             name: "SwiftVehicleProtocols",
             targets: ["SwiftVehicleProtocols"]
@@ -54,7 +58,7 @@ let package = Package(
             path: "Sources/VehicleAnalytics"
         ),
         .target(
-            name: "SwiftVehicleProtocols",
+            name: "VehicleKit",
             dependencies: [
                 "VehicleCore",
                 "VehicleISOTP",
@@ -63,12 +67,17 @@ let package = Package(
                 "VehicleTransportPanda",
                 "VehicleAnalytics"
             ],
+            path: "Sources/VehicleKit"
+        ),
+        .target(
+            name: "SwiftVehicleProtocols",
+            dependencies: ["VehicleKit"],
             path: "Sources/SwiftVehicleProtocols"
         ),
         .testTarget(
-            name: "SwiftVehicleProtocolsTests",
-            dependencies: ["SwiftVehicleProtocols"],
-            path: "Tests/SwiftVehicleProtocolsTests"
+            name: "VehicleKitTests",
+            dependencies: ["VehicleKit"],
+            path: "Tests/VehicleKitTests"
         )
     ]
 )

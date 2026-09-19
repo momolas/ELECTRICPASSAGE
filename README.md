@@ -1,11 +1,11 @@
-# 🚗 SwiftVehicleProtocols
+# 🚗 VehicleKit
 
 [![Swift](https://img.shields.io/badge/Swift-6.2-orange.svg)](https://swift.org)
 [![Platforms](https://img.shields.io/badge/Platforms-iOS%20|%20macOS%20|%20visionOS%20|%20watchOS%20|%20Linux-blue.svg)](https://developer.apple.com/swift/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-Passing%20(8/8)-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/Tests-Passing%20(24/24)-brightgreen.svg)]()
 
-**SwiftVehicleProtocols** is a high-performance, modular, and pure Swift 6 framework designed for automotive communication, diagnostic protocols, and CAN bus telemetry.
+**VehicleKit** is a high-performance, modular, and pure Swift 6 framework designed for automotive communication, diagnostic protocols, and CAN/LIN bus telemetry.
 
 Built from the ground up with **Swift Concurrency (Strict Concurrency & Sendable)**, zero UI dependencies, and optimal memory layouts for real-time applications.
 
@@ -14,13 +14,13 @@ Built from the ground up with **Swift Concurrency (Strict Concurrency & Sendable
 ## 🏛️ Architecture & Targets
 
 ```
-SwiftVehicleProtocols
-├── 🟢 VehicleCore             # Hex parsing, FormulaEvaluator (JS/Math), UDS Negative Response Codes (NRC)
+VehicleKit
+├── 🟢 VehicleCore             # Hex parsing, FormulaEvaluator (JS/Math), UDS Negative Response Codes (NRC), Unified ECU Profiles
 ├── 🔵 VehicleISOTP            # ISO 15765-2 multi-frame reassembly, flow control & 8-byte strict padding
-├── 🟣 VehicleDiagnostic       # KWP2000 (ISO 14230), UDS (ISO 14229), SecurityAccess (0x27), Freeze Frame
-├── 🟠 VehicleTransport        # Hardware abstraction protocol & full ECU SimulatorEngine
+├── 🟣 VehicleDiagnostic       # KWP2000 (ISO 14230), UDS (ISO 14229), SecurityAccess (0x27), Freeze Frame, VINReader
+├── 🟠 VehicleTransport        # Hardware abstraction protocol, BLE OBD-II driver (ELM/STN), DoIP (ISO 13400) & ECU SimulatorEngine
 ├── 🔴 VehicleTransportPanda   # Comma.ai Panda driver & Safety Models
-└── 📊 VehicleAnalytics        # Multi-Rate Sampler (10/2/0.5 Hz) & Pearson Signal Correlation
+└── 📊 VehicleAnalytics        # Multi-Rate Sampler & Pearson Signal Correlation
 ```
 
 ---
@@ -29,11 +29,11 @@ SwiftVehicleProtocols
 
 ### 1. Installation via Swift Package Manager
 
-Add `SwiftVehicleProtocols` to your `Package.swift`:
+Add `VehicleKit` to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/momolas/SwiftVehicleProtocols.git", from: "1.0.0")
+    .package(url: "https://github.com/momolas/VehicleKit.git", from: "2.0.0")
 ]
 ```
 
@@ -42,19 +42,19 @@ Or add individual submodules to keep your binary lightweight:
 .target(
     name: "MyDiagnosticTool",
     dependencies: [
-        .product(name: "VehicleDiagnostic", package: "SwiftVehicleProtocols"),
-        .product(name: "VehicleTransportPanda", package: "SwiftVehicleProtocols")
+        .product(name: "VehicleDiagnostic", package: "VehicleKit"),
+        .product(name: "VehicleTransportPanda", package: "VehicleKit")
     ]
 )
 ```
 
 ---
 
-### 2. Usage Examples
+## 2. Usage Examples
 
-#### Single-line import
+### Single-line import
 ```swift
-import SwiftVehicleProtocols
+import VehicleKit
 
 // 1. Initialize hardware transport (Panda or Simulator)
 let transport = SimulatorEngine()
