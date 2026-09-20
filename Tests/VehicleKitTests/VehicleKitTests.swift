@@ -465,5 +465,158 @@ struct VehicleKitTests {
         #expect(combined.count >= 2)
         #expect(combined.contains(where: { $0.id == "custom_oil_temp" }))
     }
+
+    // MARK: - Apple Accelerate & Signal Processing Tests
+
+    @Test("Accelerate vs Scalar Pearson Equivalence")
+    func testPearsonEquivalence() {
+        let xs = [1.2, 2.5, 3.8, 4.1, 5.9, 6.4, 7.8, 8.2]
+        let ys = [2.4, 5.1, 7.6, 8.3, 11.7, 12.9, 15.7, 16.5]
+        
+        let scalarR = SignalCorrelator.scalarPearson(x: xs, y: ys)
+        let standardR = SignalCorrelator.pearsonCorrelation(x: xs, y: ys)
+
+        #expect(scalarR != nil)
+        #expect(standardR != nil)
+        #expect(abs((scalarR ?? 0) - (standardR ?? 0)) < 1e-5)
+
+        #if canImport(Accelerate)
+        let accelR = SignalCorrelator.acceleratedPearson(x: xs, y: ys)
+        #expect(accelR != nil)
+        #expect(abs((accelR ?? 0) - (scalarR ?? 0)) < 1e-5)
+        #endif
+    }
+
+    @Test("Biquad IIR Low-Pass & Median Filter")
+    func testSignalFilter() {
+        let noisySignal = [10.0, 10.2, 50.0, 10.1, 9.9, 10.3] // 50.0 is a rogue spike
+        let medianFiltered = SignalFilter.medianFilter(values: noisySignal, windowSize: 3)
+        #expect(medianFiltered[2] < 20.0) // Rogue spike filtered out
+
+        let biquad = SignalFilter.Biquad.lowPass(cutoffFrequency: 2.0, sampleRate: 10.0)
+        let filteredBatch = biquad.filter(batch: [1.0, 1.0, 1.0, 1.0, 1.0])
+        #expect(filteredBatch.count == 5)
+        #expect(filteredBatch.last ?? 0 > 0.5)
+    }
+
+    @Test("Spectral Analyzer FFT Peak Detection")
+    func testSpectralAnalyzer() {
+        // Create 64 samples of a 10 Hz sine wave sampled at 100 Hz
+        let sampleRate = 100.0
+        let n = 64
+        var samples = [Double](repeating: 0.0, count: n)
+        for t in 0..<n {
+            let time = Double(t) / sampleRate
+            samples[t] = sin(2.0 * Double.pi * 10.0 * time)
+        }
+
+        let result = SpectralAnalyzer.analyze(samples: samples, sampleRateHz: sampleRate, topPeaksCount: 1)
+        #expect(result != nil)
+        if let peak = result?.dominantPeaks.first {
+            // Frequency peak should be very close to 10 Hz (frequency bin resolution = 100/64 ≈ 1.56 Hz)
+            #expect(abs(peak.frequencyHz - 10.0) <= 2.0)
+            #expect(peak.magnitude > 0.3)
+        }
+    }
+
+    // MARK: - VehicleML Artificial Intelligence Tests
+
+    @Test("CAN Intrusion Detector (Nominal vs Flood & Injection)")
+    func testCANIntrusionDetector() async {
+        let detector = CANIntrusionDetector(windowSize: 30)
+
+        // 1. Nominal CAN traffic
+        var report: BusAnomalyReport? = nil
+        for i in 0..<15 {
+            let frame = CANSampleFrame(canID: 0x7E0, payload: [0x02, 0x01, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00], timestampSeconds: Double(i) * 0.05)
+            report = await detector.ingest(frame: frame)
+        }
+        #expect(report?.status == .nominal)
+        #expect(report?.anomalyScore ?? 1.0 < 0.3)
+
+        // 2. Flood injection attack (< 0.1 ms between frames)
+        var floodReport: BusAnomalyReport? = nil
+        for i in 0..<20 {
+            let floodFrame = CANSampleFrame(canID: 0x123, payload: [0xFF, 0xFF, 0xAA, 0x55], timestampSeconds: 1.0 + (Double(i) * 0.00005))
+            floodReport = await detector.ingest(frame: floodFrame)
+        }
+        #expect(floodReport?.status == .busFlood)
+        #expect(floodReport?.anomalyScore ?? 0.0 > 0.8)
+    }
+
+    @Test("Semantic Signal Classifier")
+    func testSemanticSignalClassifier() {
+        // 1. Constant Marker
+        let constSignal = [0x55, 0x55, 0x55, 0x55, 0x55].map { Double($0) }
+        let resConst = SemanticSignalClassifier.classify(sliceName: "A", values: constSignal)
+        #expect(resConst.category == .constantMarker)
+
+        // 2. Incremental Frame Counter
+        let counterSignal = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+        let resCounter = SemanticSignalClassifier.classify(sliceName: "B", values: counterSignal)
+        #expect(resCounter.category == .counterOrCRC)
+
+        // 3. Engine RPM
+        let rpmSignal = [800.0, 850.0, 1200.0, 2500.0, 3200.0, 2800.0, 900.0]
+        let resRPM = SemanticSignalClassifier.classify(sliceName: "AB", values: rpmSignal)
+        #expect(resRPM.category == .engineRPM)
+
+        // 4. Slow thermal drift
+        let tempSignal = [82.0, 82.1, 82.2, 82.3, 82.4, 82.5]
+        let resTemp = SemanticSignalClassifier.classify(sliceName: "C", values: tempSignal)
+        #expect(resTemp.category == .thermalSlow)
+
+        // 5. Brake pedal pressure spike
+        let brakeSignal = [0.0, 0.0, 0.0, 0.0, 25.0, 40.0, 30.0, 0.0, 0.0]
+        let resBrake = SemanticSignalClassifier.classify(sliceName: "D", values: brakeSignal)
+        #expect(resBrake.category == .brakePedalOrPressure)
+    }
+
+    @Test("Odometer Fraud Auditor (Genuine vs Tampered)")
+    func testOdometerFraudAuditor() {
+        // 1. Genuine Vehicle
+        let genuineInput = OdometerFraudAuditor.InputData(
+            clusterMileageKm: 120000,
+            engineECUMileageKm: 120040,
+            absMileageKm: 119980,
+            transmissionMileageKm: 120010,
+            engineHours: 2400, // 120000 / 2400 = 50 km/h avg
+            dpfLastRegenerationKm: 119600,
+            freezeFrameMileages: [115000, 118000]
+        )
+        let genuineReport = OdometerFraudAuditor.audit(input: genuineInput)
+        #expect(genuineReport.riskLevel == .genuine)
+        #expect(genuineReport.riskScore < 0.15)
+        #expect(genuineReport.anomalies.isEmpty)
+
+        // 2. Severe Rollback Fraud (Cluster shows 65,000 km, but ECU shows 145,000 km and DPF regenerated at 138,000 km)
+        let fraudulentInput = OdometerFraudAuditor.InputData(
+            clusterMileageKm: 65000,
+            engineECUMileageKm: 145000,
+            absMileageKm: 144800,
+            engineHours: 3500, // 65000 / 3500 = 18.5 km/h avg
+            dpfLastRegenerationKm: 138000,
+            freezeFrameMileages: [120000]
+        )
+        let fraudReport = OdometerFraudAuditor.audit(input: fraudulentInput)
+        #expect(fraudReport.riskLevel == .confirmedTampering)
+        #expect(fraudReport.riskScore >= 0.70)
+        #expect(fraudReport.estimatedRealMileageKm == 145000)
+        #expect(!fraudReport.anomalies.isEmpty)
+    }
+
+    @Test("Battery Health Estimator")
+    func testBatteryHealthEstimator() {
+        // Healthy battery: 12.6V resting, 10.5V cranking (2.1V drop at 220A -> Ri ≈ 9.5 mΩ)
+        let goodReport = BatteryHealthEstimator.estimate(restingVoltage: 12.6, minimumCrankingVoltage: 10.5)
+        #expect(goodReport.status == .good || goodReport.status == .excellent)
+        #expect(goodReport.stateOfHealthPercent > 65.0)
+
+        // Failing battery: 12.1V resting, 8.5V cranking (severe voltage drop)
+        let badReport = BatteryHealthEstimator.estimate(restingVoltage: 12.1, minimumCrankingVoltage: 8.5)
+        #expect(badReport.status == .replaceImmediate)
+        #expect(badReport.stateOfHealthPercent < 50.0)
+    }
 }
+
 

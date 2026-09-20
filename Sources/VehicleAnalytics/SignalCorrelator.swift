@@ -1,5 +1,8 @@
 import Foundation
 import VehicleCore
+#if canImport(Accelerate)
+import Accelerate
+#endif
 
 /// Représente le résultat d'une corrélation sur une tranche de données hexadécimales.
 public struct SliceCorrelation: Identifiable, Equatable, Hashable, Sendable {
@@ -46,7 +49,53 @@ public struct SliceCorrelation: Identifiable, Equatable, Hashable, Sendable {
 public enum SignalCorrelator: Sendable {
 
     /// Calcule le coefficient de corrélation linéaire de Pearson entre deux séries
+    /// Utilise automatiquement l'accélération vectorielle SIMD (Apple Accelerate) si disponible.
     public static func pearsonCorrelation(x: [Double], y: [Double]) -> Double? {
+        guard x.count == y.count, x.count >= 2 else { return nil }
+        #if canImport(Accelerate)
+        return acceleratedPearson(x: x, y: y)
+        #else
+        return scalarPearson(x: x, y: y)
+        #endif
+    }
+
+    #if canImport(Accelerate)
+    /// Calcul vectoriel SIMD ultra-haute performance exploitant vDSP (Apple Accelerate)
+    public static func acceleratedPearson(x: [Double], y: [Double]) -> Double? {
+        guard x.count == y.count, x.count >= 2 else { return nil }
+        let n = vDSP_Length(x.count)
+
+        var meanX = 0.0
+        var meanY = 0.0
+        vDSP_meanvD(x, 1, &meanX, n)
+        vDSP_meanvD(y, 1, &meanY, n)
+
+        var negMeanX = -meanX
+        var negMeanY = -meanY
+        var dx = [Double](repeating: 0.0, count: x.count)
+        var dy = [Double](repeating: 0.0, count: y.count)
+
+        // Soustraction vectorielle SIMD en 1 passe
+        vDSP_vsaddD(x, 1, &negMeanX, &dx, 1, n)
+        vDSP_vsaddD(y, 1, &negMeanY, &dy, 1, n)
+
+        var num = 0.0
+        var sumSqX = 0.0
+        var sumSqY = 0.0
+
+        // Produits scalaires et sommes des carrés vectorisés
+        vDSP_dotprD(dx, 1, dy, 1, &num, n)
+        vDSP_svesqD(dx, 1, &sumSqX, n)
+        vDSP_svesqD(dy, 1, &sumSqY, n)
+
+        let den = sqrt(sumSqX * sumSqY)
+        guard den > 1e-9 else { return nil }
+        return num / den
+    }
+    #endif
+
+    /// Version scalaire de référence (fallback pur Swift)
+    public static func scalarPearson(x: [Double], y: [Double]) -> Double? {
         guard x.count == y.count, x.count >= 2 else { return nil }
         let n = Double(x.count)
         let meanX = x.reduce(0, +) / n
@@ -103,8 +152,19 @@ public enum SignalCorrelator: Sendable {
         var results: [SliceCorrelation] = []
 
         for (sliceName, sVals) in slices {
-            let sMin = sVals.min() ?? 0.0
-            let sMax = sVals.max() ?? 0.0
+            let sMin: Double
+            let sMax: Double
+            #if canImport(Accelerate)
+            var minVal = 0.0
+            var maxVal = 0.0
+            vDSP_minvD(sVals, 1, &minVal, vDSP_Length(sVals.count))
+            vDSP_maxvD(sVals, 1, &maxVal, vDSP_Length(sVals.count))
+            sMin = minVal
+            sMax = maxVal
+            #else
+            sMin = sVals.min() ?? 0.0
+            sMax = sVals.max() ?? 0.0
+            #endif
             let sRange = sMax - sMin
 
             for (refName, refValues) in references {

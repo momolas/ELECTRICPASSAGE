@@ -24,6 +24,7 @@ let package = Package(
         .library(name: "VehicleTransport", targets: ["VehicleTransport"]),
         .library(name: "VehicleTransportPanda", targets: ["VehicleTransportPanda"]),
         .library(name: "VehicleAnalytics", targets: ["VehicleAnalytics"]),
+        .library(name: "VehicleML", targets: ["VehicleML"]),
     ],
     dependencies: [],
     targets: [
@@ -58,6 +59,11 @@ let package = Package(
             path: "Sources/VehicleAnalytics"
         ),
         .target(
+            name: "VehicleML",
+            dependencies: ["VehicleCore", "VehicleAnalytics"],
+            path: "Sources/VehicleML"
+        ),
+        .target(
             name: "VehicleKit",
             dependencies: [
                 "VehicleCore",
@@ -65,7 +71,8 @@ let package = Package(
                 "VehicleDiagnostic",
                 "VehicleTransport",
                 "VehicleTransportPanda",
-                "VehicleAnalytics"
+                "VehicleAnalytics",
+                "VehicleML"
             ],
             path: "Sources/VehicleKit"
         ),
