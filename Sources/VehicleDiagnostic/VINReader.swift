@@ -6,7 +6,6 @@ import VehicleTransport
 public enum VINReader: Sendable {
 
     /// Lit le numéro VIN via les différents protocoles (OBD-II Mode 09 PID 02, UDS DID F190, KWP2000 LID 81/80/82)
-    @MainActor
     public static func read(interface: VehicleInterface) async throws -> String? {
         try Task.checkCancellation()
 
@@ -171,7 +170,6 @@ public enum VINReader: Sendable {
         return out
     }
 
-    @MainActor
     private static func openDiagnosticSession(interface: VehicleInterface) async throws -> Bool {
         for sessionCmd in ["1085", "1086", "1003", "1001"] {
             if let res = try? await interface.sendDiagnosticRequest(sessionCmd, timeout: 1.0) {
@@ -184,7 +182,6 @@ public enum VINReader: Sendable {
         return false
     }
 
-    @MainActor
     private static func closeDiagnosticSession(interface: VehicleInterface) async {
         _ = try? await interface.sendDiagnosticRequest("1081", timeout: 1.0)
     }

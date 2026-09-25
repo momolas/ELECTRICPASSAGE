@@ -1,8 +1,5 @@
 import Foundation
 import VehicleCore
-#if canImport(Accelerate)
-import Accelerate
-#endif
 
 /// Représente le résultat d'une corrélation sur une tranche de données hexadécimales.
 public struct SliceCorrelation: Identifiable, Equatable, Hashable, Sendable {
@@ -46,57 +43,34 @@ public struct SliceCorrelation: Identifiable, Equatable, Hashable, Sendable {
     }
 }
 
+#if canImport(Accelerate)
+import Accelerate
+#endif
+
 public enum SignalCorrelator: Sendable {
 
     /// Calcule le coefficient de corrélation linéaire de Pearson entre deux séries
-    /// Utilise automatiquement l'accélération vectorielle SIMD (Apple Accelerate) si disponible.
     public static func pearsonCorrelation(x: [Double], y: [Double]) -> Double? {
         guard x.count == y.count, x.count >= 2 else { return nil }
+
         #if canImport(Accelerate)
-        return acceleratedPearson(x: x, y: y)
-        #else
-        return scalarPearson(x: x, y: y)
-        #endif
-    }
+        let meanX = vDSP.mean(x)
+        let meanY = vDSP.mean(y)
 
-    #if canImport(Accelerate)
-    /// Calcul vectoriel SIMD ultra-haute performance exploitant vDSP (Apple Accelerate)
-    public static func acceleratedPearson(x: [Double], y: [Double]) -> Double? {
-        guard x.count == y.count, x.count >= 2 else { return nil }
-        let n = vDSP_Length(x.count)
+        let dx = vDSP.add(-meanX, x)
+        let dy = vDSP.add(-meanY, y)
 
-        var meanX = 0.0
-        var meanY = 0.0
-        vDSP_meanvD(x, 1, &meanX, n)
-        vDSP_meanvD(y, 1, &meanY, n)
+        let num = vDSP.dot(dx, dy)
+        let denX = vDSP.dot(dx, dx)
+        let denY = vDSP.dot(dy, dy)
 
-        var negMeanX = -meanX
-        var negMeanY = -meanY
-        var dx = [Double](repeating: 0.0, count: x.count)
-        var dy = [Double](repeating: 0.0, count: y.count)
-
-        // Soustraction vectorielle SIMD en 1 passe
-        vDSP_vsaddD(x, 1, &negMeanX, &dx, 1, n)
-        vDSP_vsaddD(y, 1, &negMeanY, &dy, 1, n)
-
-        var num = 0.0
-        var sumSqX = 0.0
-        var sumSqY = 0.0
-
-        // Produits scalaires et sommes des carrés vectorisés
-        vDSP_dotprD(dx, 1, dy, 1, &num, n)
-        vDSP_svesqD(dx, 1, &sumSqX, n)
-        vDSP_svesqD(dy, 1, &sumSqY, n)
-
-        let den = sqrt(sumSqX * sumSqY)
+        guard denX > 1e-12, denY > 1e-12 else { return nil }
+        let den = sqrt(denX) * sqrt(denY)
         guard den > 1e-9 else { return nil }
-        return num / den
-    }
-    #endif
-
-    /// Version scalaire de référence (fallback pur Swift)
-    public static func scalarPearson(x: [Double], y: [Double]) -> Double? {
-        guard x.count == y.count, x.count >= 2 else { return nil }
+        let r = num / den
+        guard r.isFinite else { return nil }
+        return max(-1.0, min(1.0, r))
+        #else
         let n = Double(x.count)
         let meanX = x.reduce(0, +) / n
         let meanY = y.reduce(0, +) / n
@@ -113,9 +87,75 @@ public enum SignalCorrelator: Sendable {
             denY += dy * dy
         }
 
-        let den = sqrt(denX * denY)
+        guard denX > 1e-12, denY > 1e-12 else { return nil }
+        let den = sqrt(denX) * sqrt(denY)
         guard den > 1e-9 else { return nil }
-        return num / den
+        let r = num / den
+        guard r.isFinite else { return nil }
+        return max(-1.0, min(1.0, r))
+        #endif
+    }
+
+    /// Calcule la corrélation croisée avec décalage temporel (Time-Lag $\tau$) entre deux séries temporelles.
+    ///
+    /// Permet de mesurer le déphasage ou retard de réponse physique (ex: turbo lag, délai papillon/régime).
+    ///
+    /// - Parameters:
+    ///   - x: Série temporelle de commande (ex: position papillon, consigne).
+    ///   - y: Série temporelle de réponse (ex: pression de suralimentation, régime).
+    ///   - maxLag: Nombre maximum d'échantillons de décalage à explorer (\(\tau \in [-maxLag, +maxLag]\)).
+    /// - Returns: Tuple contenant le meilleur lag (en échantillons), la corrélation maximale et la carte des corrélations par lag.
+    public static func crossCorrelationWithLag(
+        x: [Double],
+        y: [Double],
+        maxLag: Int = 10
+    ) -> (bestLag: Int, bestCorrelation: Double, lags: [Int: Double]) {
+        guard x.count == y.count, x.count >= 4, maxLag >= 0 else {
+            return (0, 0.0, [:])
+        }
+
+        let n = x.count
+        let bound = min(maxLag, n / 2)
+        var lagMap: [Int: Double] = [:]
+        var bestLag = 0
+        var bestCorrelation = 0.0
+
+        for lag in -bound...bound {
+            let sliceX: [Double]
+            let sliceY: [Double]
+
+            if lag >= 0 {
+                sliceX = Array(x[0..<(n - lag)])
+                sliceY = Array(y[lag..<n])
+            } else {
+                let k = -lag
+                sliceX = Array(x[k..<n])
+                sliceY = Array(y[0..<(n - k)])
+            }
+
+            if let r = pearsonCorrelation(x: sliceX, y: sliceY) {
+                lagMap[lag] = r
+                if abs(r) > abs(bestCorrelation) {
+                    bestCorrelation = r
+                    bestLag = lag
+                }
+            }
+        }
+
+        return (bestLag, bestCorrelation, lagMap)
+    }
+
+    /// Génère une étiquette de colonne unique (A..Z, AA..AZ, etc.)
+    public static func sliceLabel(for index: Int) -> String {
+        guard index >= 0 else { return "" }
+        var idx = index
+        var result = ""
+        repeat {
+            let rem = idx % 26
+            result = String(Character(UnicodeScalar(65 + UInt8(rem)))) + result
+            idx = (idx / 26) - 1
+        } while idx >= 0
+        return result
     }
 
     /// Analyse les corrélations de toutes les tranches 8-bit et 16-bit d'une matrice d'octets avec des signaux de référence
@@ -126,7 +166,7 @@ public enum SignalCorrelator: Sendable {
     ) -> [SliceCorrelation] {
         guard !byteRows.isEmpty, !references.isEmpty else { return [] }
         let nBytes = byteRows[0].count
-        guard nBytes > 0 else { return [] }
+        guard nBytes > 0, byteRows.allSatisfy({ $0.count >= nBytes }) else { return [] }
 
         var minCount = byteRows.count
         for (_, refValues) in references {
@@ -137,8 +177,8 @@ public enum SignalCorrelator: Sendable {
         let alignedRows = Array(byteRows.suffix(minCount))
         var slices: [String: [Double]] = [:]
 
-        // Génération des tranches 8-bit (A, B, C...)
-        let labels = (0..<nBytes).map { String(Character(UnicodeScalar(UInt8(65 + ($0 % 26))))) }
+        // Génération des tranches 8-bit (A, B, C... sans collision au-delà de 26 octets)
+        let labels = (0..<nBytes).map { sliceLabel(for: $0) }
         for i in 0..<nBytes {
             slices[labels[i]] = alignedRows.map { Double($0[i]) }
         }
@@ -152,18 +192,12 @@ public enum SignalCorrelator: Sendable {
         var results: [SliceCorrelation] = []
 
         for (sliceName, sVals) in slices {
-            let sMin: Double
-            let sMax: Double
             #if canImport(Accelerate)
-            var minVal = 0.0
-            var maxVal = 0.0
-            vDSP_minvD(sVals, 1, &minVal, vDSP_Length(sVals.count))
-            vDSP_maxvD(sVals, 1, &maxVal, vDSP_Length(sVals.count))
-            sMin = minVal
-            sMax = maxVal
+            let sMin = vDSP.minimum(sVals)
+            let sMax = vDSP.maximum(sVals)
             #else
-            sMin = sVals.min() ?? 0.0
-            sMax = sVals.max() ?? 0.0
+            let sMin = sVals.min() ?? 0.0
+            let sMax = sVals.max() ?? 0.0
             #endif
             let sRange = sMax - sMin
 

@@ -533,40 +533,17 @@ public final class OBD2Analyzer: Sendable {
 
     // MARK: - Formules Mathématiques Internes
 
+    private static let formulaEvaluator = FormulaEvaluator()
+
     private static func applyFormula(_ formula: String, bytes: [UInt8]) -> String? {
         guard !bytes.isEmpty else { return nil }
-        let a = Double(bytes[0])
-        let b = bytes.count > 1 ? Double(bytes[1]) : 0.0
-        let c = bytes.count > 2 ? Double(bytes[2]) : 0.0
-        let d = bytes.count > 3 ? Double(bytes[3]) : 0.0
+        guard let value = formulaEvaluator.evaluate(formula: formula, bytes: bytes) else { return nil }
 
-        // Parse simpliste de formules standardisées
-        if formula == "A-40" {
-            return (a - 40.0).formatted(.number.precision(.fractionLength(0)))
-        } else if formula == "(A*256+B)/4" || formula == "(A*256+B)*100/255" || formula == "(A*256+B)/100" || formula == "(A*256+B)/10-40" {
-            // Formules doubles
-            let comb = a * 256.0 + b
-            if formula == "(A*256+B)/4" {
-                return (comb / 4.0).formatted(.number.precision(.fractionLength(0)))
-            } else if formula == "(A*256+B)*100/255" {
-                return (comb * 100.0 / 255.0).formatted(.number.precision(.fractionLength(1)))
-            } else if formula == "(A*256+B)/100" {
-                return (comb / 100.0).formatted(.number.precision(.fractionLength(2)))
-            } else if formula == "(A*256+B)/10-40" {
-                return (comb / 10.0 - 40.0).formatted(.number.precision(.fractionLength(1)))
-            }
-        } else if formula == "A*100/255" {
-            return (a * 100.0 / 255.0).formatted(.number.precision(.fractionLength(1)))
-        } else if formula == "A" {
-            return a.formatted(.number.precision(.fractionLength(0)))
-        } else if formula == "A*256+B" {
-            return (a * 256.0 + b).formatted(.number.precision(.fractionLength(0)))
-        } else if formula == "(A*16777216+B*65536+C*256+D)/10" {
-            let odometer = (a * 16777216.0 + b * 65536.0 + c * 256.0 + d) / 10.0
-            return odometer.formatted(.number.precision(.fractionLength(1)))
+        if value.rounded() == value && abs(value) < 1e9 {
+            return String(Int(value))
+        } else {
+            return value.formatted(.number.precision(.fractionLength(1...2)))
         }
-
-        return nil
     }
 
     // MARK: - Classification de Protocole & SAE J1939

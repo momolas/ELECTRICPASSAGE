@@ -100,7 +100,7 @@ public enum CANProtocolDetector {
         }
 
         // 5. KWP2000 Diagnostic Ranges (0x600...0x607, 0x640...0x67F, 0x740...0x77F)
-        if (0x600...0x607).contains(canID) || (0x640...0x67F).contains(canID) {
+        if (0x600...0x607).contains(canID) || (0x640...0x67F).contains(canID) || (0x740...0x77F).contains(canID) {
             return CANProtocolClassification(
                 protocolType: .kwp2000,
                 standardName: "ISO 14230 (KWP2000)",

@@ -42,31 +42,33 @@ public actor ISOTPReassembler {
             return .error("Trame vide")
         }
 
-        let pci = data[0] >> 4
+        // Ré-ancre le buffer pour garantir startIndex == 0 même si un Data slice (SubSequence) est fourni
+        let frame = data.startIndex == 0 ? data : Data(data)
+        let pci = frame[0] >> 4
 
         switch pci {
         case 0: // Single Frame (SF)
-            let length = Int(data[0] & 0x0F)
+            let length = Int(frame[0] & 0x0F)
             guard length > 0 else {
                 return .error("Longueur Single Frame invalide (0)")
             }
-            guard data.count >= length + 1 else {
+            guard frame.count >= length + 1 else {
                 return .error("Trame Single Frame trop courte pour la longueur déclarée (\(length))")
             }
             states.removeValue(forKey: address)
-            let payload = data[1...length]
+            let payload = frame[1...length]
             return .completed(Data(payload))
 
         case 1: // First Frame (FF)
-            guard data.count >= 2 else {
+            guard frame.count >= 2 else {
                 return .error("Trame First Frame incomplète")
             }
-            let length = Int((UInt16(data[0] & 0x0F) << 8) | UInt16(data[1]))
+            let length = Int((UInt16(frame[0] & 0x0F) << 8) | UInt16(frame[1]))
             guard length > 7 else {
                 return .error("Longueur First Frame invalide (\(length))")
             }
 
-            let payload = data[2...]
+            let payload = frame[2...]
             states[address] = ReassemblyState(
                 totalLength: length,
                 buffer: Data(payload),
@@ -79,13 +81,13 @@ public actor ISOTPReassembler {
                 return .error("Trame Consecutive Frame orpheline sur 0x\(String(format: "%X", address))")
             }
 
-            let sequence = data[0] & 0x0F
+            let sequence = frame[0] & 0x0F
             guard sequence == state.nextSequence else {
                 states.removeValue(forKey: address)
                 return .error("Erreur séquence ISO-TP : reçu \(sequence), attendu \(state.nextSequence)")
             }
 
-            let payload = data[1...]
+            let payload = frame[1...]
             state.buffer.append(payload)
             state.nextSequence = (state.nextSequence + 1) & 0x0F
 

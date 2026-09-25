@@ -21,7 +21,13 @@ public actor DoIPClient: VehicleInterface {
     public func connect() async throws {
         // Initialisation de session DoIP
         self.isConnected = true
-        try await activateRouting()
+        do {
+            try await activateRouting()
+        } catch {
+            self.isConnected = false
+            self.isRoutingActivated = false
+            throw error
+        }
     }
 
     public func disconnect() async {
@@ -30,7 +36,8 @@ public actor DoIPClient: VehicleInterface {
     }
 
     public func setTarget(txID: String, rxID: String?) async throws {
-        if let target = UInt16(txID, radix: 16) {
+        let clean = txID.lowercased().hasPrefix("0x") ? String(txID.dropFirst(2)) : txID
+        if let target = UInt16(clean.trimmingCharacters(in: .whitespacesAndNewlines), radix: 16) {
             self.targetLogicalAddress = target
         }
     }
@@ -56,8 +63,8 @@ public actor DoIPClient: VehicleInterface {
 
     /// Envoie une requête diagnostique encapsulée en DoIP (Payload Type 0x8001).
     public func sendDiagnosticRequest(_ requestHex: String, timeout: TimeInterval = 2.0) async throws -> String {
-        guard isConnected else {
-            throw NSError(domain: "DoIPClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "DoIP non connecté"])
+        guard isConnected, isRoutingActivated else {
+            throw NSError(domain: "DoIPClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "DoIP non connecté ou routage non activé"])
         }
 
         let cleanHex = requestHex.replacing( " ", with: "")

@@ -7,6 +7,7 @@ public actor UDSClient {
 
     private let interface: VehicleInterface
     private var testerPresentTask: Task<Void, Never>?
+    private var isAtomicTransactionActive: Bool = false
 
     public enum UDSError: LocalizedError, Sendable {
         case negativeResponse(service: UInt8, nrc: UInt8, message: String)
@@ -131,19 +132,30 @@ public actor UDSClient {
         try validatePositiveResponse(response, expectedSID: 0x2E)
     }
 
+    // MARK: - Transactions Atomiques & Isolation de Keepalive
+
+    public func withAtomicTransaction<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
+        isAtomicTransactionActive = true
+        defer { isAtomicTransactionActive = false }
+        return try await operation()
+    }
+
     // MARK: - SecurityAccess (0x27)
 
     public func performSecurityAccess(
         level: UInt8,
         keyCalculation: @Sendable (String) async throws -> String
     ) async throws {
+        isAtomicTransactionActive = true
+        defer { isAtomicTransactionActive = false }
+
         // 1. Request Seed (27 + Odd Subfunction)
         let requestLevel = level % 2 == 0 ? level - 1 : level
         let seedCmd = String(format: "27%02X", requestLevel)
         let seedResponse = try await sendRaw(seedCmd)
         try validatePositiveResponse(seedResponse, expectedSID: 0x27)
 
-        let cleanSeedResp = seedResponse.replacing( " ", with: "")
+        let cleanSeedResp = seedResponse.replacing(" ", with: "")
         guard cleanSeedResp.count >= 4 else {
             throw UDSError.invalidResponseFormat("Graine UDS trop courte: \(seedResponse)")
         }
@@ -173,7 +185,7 @@ public actor UDSClient {
     // MARK: - InputOutputControlByIdentifier (0x2F)
 
     public func inputOutputControl(did: UInt16, controlType: IOControlType, controlState: String = "") async throws -> String {
-        let cleanState = controlState.replacing( " ", with: "")
+        let cleanState = controlState.replacing(" ", with: "")
         let hexCmd = String(format: "2F%04X%02X%@", did, controlType.rawValue, cleanState)
         let response = try await sendRaw(hexCmd)
         try validatePositiveResponse(response, expectedSID: 0x2F)
@@ -183,7 +195,7 @@ public actor UDSClient {
     // MARK: - RoutineControl (0x31)
 
     public func startRoutine(routineType: UInt8 = 0x01, routineId: UInt16, optionHex: String = "") async throws -> String {
-        let cleanOption = optionHex.replacing( " ", with: "")
+        let cleanOption = optionHex.replacing(" ", with: "")
         let hexCmd = String(format: "31%02X%04X%@", routineType, routineId, cleanOption)
         let response = try await sendRaw(hexCmd)
         try validatePositiveResponse(response, expectedSID: 0x31)
@@ -206,10 +218,15 @@ public actor UDSClient {
         testerPresentTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
-                guard let self else { break }
-                _ = try? await self.interface.sendDiagnosticRequest("3E80", timeout: 0.5)
+                guard let self, !Task.isCancelled else { break }
+                await self.sendTesterPresent()
             }
         }
+    }
+
+    private func sendTesterPresent() async {
+        guard !isAtomicTransactionActive else { return }
+        _ = try? await self.interface.sendDiagnosticRequest("3E80", timeout: 0.5)
     }
 
     // MARK: - Raw Transfer Helpers

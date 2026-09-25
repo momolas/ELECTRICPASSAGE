@@ -78,10 +78,14 @@ public enum KWP2000Error: Error, LocalizedError, Sendable {
 }
 
 /// Gère les opérations de diagnostic avancées via le protocole KWP2000 (ISO 14230).
-@MainActor
-public final class KWP2000Client {
+public actor KWP2000Client {
     private let interface: VehicleInterface
     private var testerPresentTask: Task<Void, Never>?
+    private var isAtomicTransactionActive: Bool = false
+
+    deinit {
+        testerPresentTask?.cancel()
+    }
 
     public init(interface: VehicleInterface) {
         self.interface = interface
@@ -154,8 +158,11 @@ public final class KWP2000Client {
         return cleanResponse
     }
 
-    /// Effectue la routine SecurityAccess (Service 27)
+    /// Effectue la routine SecurityAccess (Service 27) de manière atomique sans interférence TesterPresent.
     public func performSecurityAccess(level: UInt8, keyCalculator: @Sendable (String) -> String) async throws {
+        isAtomicTransactionActive = true
+        defer { isAtomicTransactionActive = false }
+
         let requestSeedCmd = String(format: "27%02X", level)
         let seedResponse = try await interface.sendDiagnosticRequest(requestSeedCmd, timeout: 2.0)
         let cleanSeedResp = seedResponse.replacing( " ", with: "").uppercased()
@@ -191,6 +198,14 @@ public final class KWP2000Client {
         }
     }
 
+    /// Exécute une opération atomique sur le bus KWP2000 (ex: upload/download mémoire)
+    /// en suspendant l'envoi de trames TesterPresent susceptibles de polluer la séquence.
+    public func withAtomicTransaction<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
+        isAtomicTransactionActive = true
+        defer { isAtomicTransactionActive = false }
+        return try await operation()
+    }
+
     /// Lit l'identification ECU (Service 1A)
     public func readECUIdentification(option: UInt8 = 0x80) async throws -> String {
         let command = String(format: "1A%02X", option)
@@ -210,8 +225,8 @@ public final class KWP2000Client {
         return String(clean.dropFirst(4))
     }
 
-    /// Efface la mémoire des défauts (Service 14)
-    public func clearDiagnosticInformation(group: String = "FFFFFF") async throws {
+    /// Efface la mémoire des défauts (Service 14) selon ISO 14230 (groupe 2 octets, ex: "FF00")
+    public func clearDiagnosticInformation(group: String = "FF00") async throws {
         let command = "14" + group.replacing( " ", with: "").uppercased()
         let response = try await interface.sendDiagnosticRequest(command, timeout: 3.0)
         let clean = response.replacing( " ", with: "").uppercased()
@@ -246,6 +261,7 @@ public final class KWP2000Client {
 
     /// Maintien de session (Service 3E - Tester Present)
     public func sendTesterPresent(suppressResponse: Bool = false) async throws {
+        guard !isAtomicTransactionActive else { return }
         let command = suppressResponse ? "3E80" : "3E00"
         let response = try await interface.sendDiagnosticRequest(command, timeout: 1.0)
         let clean = response.replacing( " ", with: "").uppercased()

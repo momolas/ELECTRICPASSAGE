@@ -63,7 +63,13 @@ public enum DTCDecoder: Sendable {
 
         // 1. OBD-II Mode 03 (43...), Mode 07 (47...), Mode 0A (4A...)
         if clean.hasPrefix("43") || clean.hasPrefix("47") || clean.hasPrefix("4A") {
-            let data = String(clean.dropFirst(4)) // Supprime 43 + NN
+            // SAE J1979 standard : pas d'octet de compte (supprime SID 2 chars).
+            // Format legacy : octet de compte valide si et seulement si possibleCount * 4 == remainingAfterCount
+            let remainingAfterCount = clean.count - 4
+            let possibleCount = Int(clean.dropFirst(2).prefix(2), radix: 16) ?? -1
+            let isLegacyWithCount = (remainingAfterCount >= 4 && remainingAfterCount % 4 == 0 && possibleCount > 0 && possibleCount * 4 == remainingAfterCount)
+            let dropCount = isLegacyWithCount ? 4 : 2
+            let data = String(clean.dropFirst(dropCount))
             for i in stride(from: 0, to: data.count - 3, by: 4) {
                 let startIndex = data.index(data.startIndex, offsetBy: i)
                 let endIndex = data.index(startIndex, offsetBy: 4)

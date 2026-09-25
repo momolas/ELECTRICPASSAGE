@@ -76,7 +76,7 @@ public struct DoIPMessage: Sendable, Equatable {
         
         let payloadStart = data.startIndex + 8
         let payloadEnd = payloadStart + Int(length)
-        guard data.count >= payloadEnd else { return nil }
+        guard data.endIndex >= payloadEnd else { return nil }
         
         let payload = data.subdata(in: payloadStart..<payloadEnd)
         return DoIPMessage(protocolVersion: version, payloadType: payloadType, payload: payload)

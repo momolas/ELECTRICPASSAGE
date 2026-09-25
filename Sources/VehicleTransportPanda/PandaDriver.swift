@@ -45,11 +45,13 @@ public actor PandaDriver: VehicleInterface {
     }
 
     public func setTarget(txID: String, rxID: String?) async throws {
-        self.currentTx = txID
+        let cleanTx = txID.lowercased().hasPrefix("0x") ? String(txID.dropFirst(2)) : txID
+        self.currentTx = cleanTx
         if let rxID {
-            self.currentRx = rxID
+            let cleanRx = rxID.lowercased().hasPrefix("0x") ? String(rxID.dropFirst(2)) : rxID
+            self.currentRx = cleanRx
         } else {
-            let txVal = UInt32(txID, radix: 16) ?? 0x7E0
+            let txVal = UInt32(cleanTx.trimmingCharacters(in: .whitespacesAndNewlines), radix: 16) ?? 0x7E0
             self.currentRx = String(format: "%X", txVal + 8)
         }
     }

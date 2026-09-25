@@ -40,7 +40,7 @@ let package = Package(
         ),
         .target(
             name: "VehicleDiagnostic",
-            dependencies: ["VehicleCore", "VehicleISOTP", "VehicleTransport"],
+            dependencies: ["VehicleCore", "VehicleTransport"],
             path: "Sources/VehicleDiagnostic"
         ),
         .target(
@@ -86,5 +86,6 @@ let package = Package(
             dependencies: ["VehicleKit"],
             path: "Tests/VehicleKitTests"
         )
-    ]
+    ],
+    swiftLanguageModes: [.v6]
 )

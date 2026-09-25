@@ -7,9 +7,9 @@ public enum SamplingRate: String, Sendable, CaseIterable, Identifiable, Codable 
     case fast = "Rapide (10 Hz)"
     case normal = "Normal (2 Hz)"
     case slow = "Lent (0.5 Hz)"
-    
+
     public var id: String { rawValue }
-    
+
     public var shortName: String {
         switch self {
         case .fast: return "10 Hz"
@@ -17,7 +17,7 @@ public enum SamplingRate: String, Sendable, CaseIterable, Identifiable, Codable 
         case .slow: return "0.5 Hz"
         }
     }
-    
+
     /// Diviseur de cycle basé sur une boucle de base à 10 Hz
     public var tickDivider: Int {
         switch self {
@@ -26,7 +26,7 @@ public enum SamplingRate: String, Sendable, CaseIterable, Identifiable, Codable 
         case .slow: return 20  // Tous les 20 ticks (~0.5 Hz)
         }
     }
-    
+
     public var iconName: String {
         switch self {
         case .fast: return "bolt.fill"
@@ -36,10 +36,10 @@ public enum SamplingRate: String, Sendable, CaseIterable, Identifiable, Codable 
     }
 }
 
-/// Tick-driven multi-rate sampler. Ordonnance les requêtes PID selon leur cadence
-/// (rapide, normal, lent) pour maximiser le débit sans saturer le bus OBD.
-@MainActor
-public final class Sampler {
+/// Tick-driven multi-rate sampler & orchestrateur de requêtes multi-PIDs (SAE J1979).
+/// Conçu sous forme d'`actor` Swift 6 natif découplé du MainActor pour maximiser le débit d'acquisition
+/// sans bloquer l'interface graphique.
+public actor Sampler {
 
     public struct LiveValue: Sendable, Identifiable {
         public var id: String { pidID }
@@ -97,7 +97,6 @@ public final class Sampler {
     private var stopped = false
     public private(set) var tickCount: Int = 0
 
-    /// Per-PID strike counter. After 3 NO_DATA responses, the PID is demoted
     private var strikes: [String: Int] = [:]
     public private(set) var disabledPIDs: Set<String> = []
 
@@ -106,6 +105,15 @@ public final class Sampler {
 
     public var onValues: (@Sendable ([LiveValue]) -> Void)?
     public var onTick: (@Sendable (TickRow) -> Void)?
+
+    private var streamContinuations: [UUID: AsyncStream<[LiveValue]>.Continuation] = [:]
+
+    deinit {
+        task?.cancel()
+        for continuation in streamContinuations.values {
+            continuation.finish()
+        }
+    }
 
     public init(
         driver: VehicleInterface,
@@ -125,11 +133,39 @@ public final class Sampler {
         self.evaluator = evaluator ?? FormulaEvaluator()
     }
 
+    public func setOnValues(_ handler: (@Sendable ([LiveValue]) -> Void)?) {
+        self.onValues = handler
+    }
+
+    public func setOnTick(_ handler: (@Sendable (TickRow) -> Void)?) {
+        self.onTick = handler
+    }
+
+    /// Flux asynchrone d'observation des valeurs en direct.
+    public func liveValues() -> AsyncStream<[LiveValue]> {
+        let streamID = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: [LiveValue].self,
+            bufferingPolicy: .bufferingNewest(50)
+        )
+        continuation.onTermination = { [weak self] _ in
+            Task { [weak self] in
+                await self?.removeStream(id: streamID)
+            }
+        }
+        self.streamContinuations[streamID] = continuation
+        return stream
+    }
+
+    private func removeStream(id: UUID) {
+        streamContinuations.removeValue(forKey: id)
+    }
+
     /// Détermine la cadence par défaut optimale selon la nature du signal
     public static func defaultSamplingRate(for pid: PidDef) -> SamplingRate {
         let idLower = pid.id.lowercased()
         let nameLower = pid.displayName.lowercased()
-        
+
         // PIDs haute dynamique -> Fast (10 Hz)
         if idLower.contains("rpm") || idLower.contains("regime") ||
            idLower.contains("speed") || idLower.contains("vitesse") ||
@@ -138,7 +174,7 @@ public final class Sampler {
            idLower.contains("couple") || idLower.contains("pressure_intake") {
             return .fast
         }
-        
+
         // PIDs thermiques / statiques -> Slow (0.5 Hz)
         if idLower.contains("temp") || nameLower.contains("température") ||
            idLower.contains("fuel_level") || idLower.contains("carburant") ||
@@ -146,31 +182,36 @@ public final class Sampler {
            idLower.contains("oil_level") || idLower.contains("vin") || idLower.contains("distance") {
             return .slow
         }
-        
+
         return .normal
     }
 
     public func start() {
+        guard task == nil else { return }
+        stopped = false
         task = Task { [weak self] in
-            guard let self else { return }
-            let intervalNs = UInt64(1_000_000_000.0 / self.baseLoopRateHz)
-            while !Task.isCancelled && !self.stopped {
+            await self?.runLoop()
+        }
+    }
+
+    private func runLoop() async {
+        let intervalNs = UInt64(1_000_000_000.0 / baseLoopRateHz)
+        while !Task.isCancelled && !stopped {
+            do {
+                try Task.checkCancellation()
+            } catch {
+                break
+            }
+            let tickStart = Date.now
+            let row = await runOneTick()
+            dispatchTick(row)
+            let elapsed = Date.now.timeIntervalSince(tickStart)
+            let remaining = max(0, (Double(intervalNs) / 1_000_000_000.0) - elapsed)
+            if remaining > 0 {
                 do {
-                    try Task.checkCancellation()
+                    try await Task.sleep(for: .seconds(remaining))
                 } catch {
                     break
-                }
-                let tickStart = Date.now
-                let row = await self.runOneTick()
-                self.onTick?(row)
-                let elapsed = Date.now.timeIntervalSince(tickStart)
-                let remaining = max(0, (Double(intervalNs) / 1_000_000_000.0) - elapsed)
-                if remaining > 0 {
-                    do {
-                        try await Task.sleep(for: .seconds(remaining))
-                    } catch {
-                        break
-                    }
                 }
             }
         }
@@ -180,11 +221,26 @@ public final class Sampler {
         stopped = true
         task?.cancel()
         task = nil
+        for continuation in streamContinuations.values {
+            continuation.finish()
+        }
+        streamContinuations.removeAll()
     }
 
-    private func runOneTick() async -> TickRow {
+    private func dispatchTick(_ row: TickRow) {
+        onTick?(row)
+    }
+
+    private func broadcastValues(_ values: [LiveValue]) {
+        onValues?(values)
+        for continuation in streamContinuations.values {
+            continuation.yield(values)
+        }
+    }
+
+    public func runOneTick() async -> TickRow {
         tickCount += 1
-        
+
         // Réhabilitation périodique des PIDs silencieux
         if tickCount % rehabEveryNTicks == 0, !disabledPIDs.isEmpty {
             disabledPIDs.removeAll()
@@ -197,87 +253,162 @@ public final class Sampler {
 
         var values: [String: String] = [:]
         var liveValuesCollected: [LiveValue] = []
-        
+
         // Filtrage Multi-Rate : ne retenir que les PIDs arrivés à échéance lors de ce tick
         let eligiblePids = pids.filter { pid in
             guard !disabledPIDs.contains(pid.id) else { return false }
             let rate = customRates[pid.id] ?? Self.defaultSamplingRate(for: pid)
             return (tickCount % rate.tickDivider) == 0
         }
-        
+
         if eligiblePids.isEmpty {
             return TickRow(timestampISO: timestampISO, elapsedMs: elapsedMs, values: values)
         }
-        
+
         let groups = groupByEcu(eligiblePids)
         for (ecuName, groupPIDs) in groups {
-            if Task.isCancelled || self.stopped { break }
+            if Task.isCancelled || stopped { break }
             if let ecu = ecus[ecuName] {
                 _ = try? await driver.setTarget(txID: ecu.requestHeader, rxID: ecu.responseHeader)
             }
-            for (mode, pid, defs) in dedupeByQuery(groupPIDs) {
-                if Task.isCancelled || self.stopped { break }
-                let request = mode + pid
-                let response: String
-                do {
-                    response = try await driver.sendDiagnosticRequest(request, timeout: 1.0)
-                } catch is CancellationError {
-                    break
-                } catch {
-                    for def in defs { bumpStrike(def.id) }
-                    try? await Task.sleep(for: .nanoseconds(Int(interQueryGapNs)))
-                    continue
-                }
-                
-                try? await Task.sleep(for: .nanoseconds(Int(interQueryGapNs)))
-                let normalized = response.uppercased()
-                    .replacing( " ", with: "")
-                    .replacing( "\n", with: "")
-                    .replacing( "\r", with: "")
-                if normalized.contains("NODATA") || normalized.contains("STOPPED") {
-                    for def in defs { bumpStrike(def.id) }
-                    continue
-                }
-                guard let payload = extractPayload(response: response, mode: mode, pid: pid) else {
-                    for def in defs { bumpStrike(def.id) }
-                    continue
-                }
-                if !payload.isEmpty, payload.allSatisfy({ $0 == 0xFF }) {
-                    for def in defs { bumpStrike(def.id) }
-                    continue
-                }
-                for def in defs {
-                    strikes[def.id] = 0
-                    let evaluated = evaluator.evaluate(formula: def.formula, bytes: payload)
-                    let formatted: String = {
-                        if let v = evaluated {
-                            return Sampler.format(value: v)
-                        } else {
-                            return HexParsing.hex(payload)
+
+            // Séparation des requêtes Mode 01 (éligibles multi-PIDs) et des autres modes
+            let mode01Pids = groupPIDs.filter { $0.mode == "01" }
+            let otherPids = groupPIDs.filter { $0.mode != "01" }
+
+            // 1. Exécution par lot Multi-PIDs pour Mode 01 (paquets de 4 PIDs)
+            if !mode01Pids.isEmpty {
+                let chunks = mode01Pids.chunked(into: 4)
+                for chunk in chunks {
+                    if Task.isCancelled || stopped { break }
+                    let queryPids = Array(Set(chunk.map { $0.pid.uppercased() })).sorted()
+                    let multiRequest = "01" + queryPids.joined()
+                    var handled = false
+
+                    do {
+                        let response = try await driver.sendDiagnosticRequest(multiRequest, timeout: 1.0)
+                        try? await Task.sleep(for: .nanoseconds(Int(interQueryGapNs)))
+
+                        if let extracted = extractMultiPayloads(response: response, requestedPids: queryPids) {
+                            var missingPids: [PidDef] = []
+                            for def in chunk {
+                                if let payload = extracted[def.pid.uppercased()] {
+                                    strikes[def.id] = 0
+                                    let evaluated = evaluator.evaluate(formula: def.formula, bytes: payload)
+                                    let formatted: String = {
+                                        if let v = evaluated {
+                                            return Self.format(value: v)
+                                        } else {
+                                            return HexParsing.hex(payload)
+                                        }
+                                    }()
+                                    values[def.id] = formatted
+                                    let rate = customRates[def.id] ?? Self.defaultSamplingRate(for: def)
+                                    let live = LiveValue(
+                                        pidID: def.id,
+                                        raw: HexParsing.hex(payload),
+                                        value: evaluated,
+                                        unit: def.unit,
+                                        displayName: def.displayName,
+                                        category: def.category,
+                                        samplingRate: rate,
+                                        timestamp: Date.now
+                                    )
+                                    liveValuesCollected.append(live)
+                                } else {
+                                    missingPids.append(def)
+                                }
+                            }
+
+                            // Fallback unitaire pour les PIDs omis par l'ECU dans la réponse groupée
+                            for def in missingPids {
+                                if let live = await querySinglePid(mode: def.mode, pid: def.pid, def: def, values: &values) {
+                                    liveValuesCollected.append(live)
+                                }
+                            }
+                            handled = true
                         }
-                    }()
-                    values[def.id] = formatted
-                    let rate = customRates[def.id] ?? Self.defaultSamplingRate(for: def)
-                    let live = LiveValue(
-                        pidID: def.id,
-                        raw: HexParsing.hex(payload),
-                        value: evaluated,
-                        unit: def.unit,
-                        displayName: def.displayName,
-                        category: def.category,
-                        samplingRate: rate,
-                        timestamp: Date.now
-                    )
-                    liveValuesCollected.append(live)
+                    } catch is CancellationError {
+                        break
+                    } catch {
+                        // Fallback vers requêtage unitaire si erreur réseau
+                    }
+
+                    // Fallback unitaire si la réponse multi-PIDs n'a pas pu être décodée
+                    if !handled && !Task.isCancelled && !stopped {
+                        for def in chunk {
+                            if let live = await querySinglePid(mode: def.mode, pid: def.pid, def: def, values: &values) {
+                                liveValuesCollected.append(live)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Exécution unitaire pour les autres modes (UDS, KWP2000)
+            for (mode, pid, defs) in dedupeByQuery(otherPids) {
+                if Task.isCancelled || stopped { break }
+                for def in defs {
+                    if let live = await querySinglePid(mode: mode, pid: pid, def: def, values: &values) {
+                        liveValuesCollected.append(live)
+                    }
                 }
             }
         }
-        
+
         if !liveValuesCollected.isEmpty {
-            onValues?(liveValuesCollected)
+            broadcastValues(liveValuesCollected)
         }
-        
+
         return TickRow(timestampISO: timestampISO, elapsedMs: elapsedMs, values: values)
+    }
+
+    private func querySinglePid(
+        mode: String,
+        pid: String,
+        def: PidDef,
+        values: inout [String: String]
+    ) async -> LiveValue? {
+        let request = mode + pid
+        let response: String
+        do {
+            response = try await driver.sendDiagnosticRequest(request, timeout: 1.0)
+        } catch is CancellationError {
+            return nil
+        } catch {
+            bumpStrike(def.id)
+            try? await Task.sleep(for: .nanoseconds(Int(interQueryGapNs)))
+            return nil
+        }
+
+        try? await Task.sleep(for: .nanoseconds(Int(interQueryGapNs)))
+        let normalized = response.uppercased().replacingOccurrences(of: " ", with: "")
+        if normalized.contains("NODATA") || normalized.contains("STOPPED") {
+            bumpStrike(def.id)
+            return nil
+        }
+        guard let payload = extractPayload(response: response, mode: mode, pid: pid),
+              !payload.isEmpty, !payload.allSatisfy({ $0 == 0xFF }) else {
+            bumpStrike(def.id)
+            return nil
+        }
+
+        strikes[def.id] = 0
+        let evaluated = evaluator.evaluate(formula: def.formula, bytes: payload)
+        let formatted = evaluated != nil ? Self.format(value: evaluated!) : HexParsing.hex(payload)
+        values[def.id] = formatted
+        let rate = customRates[def.id] ?? Self.defaultSamplingRate(for: def)
+
+        return LiveValue(
+            pidID: def.id,
+            raw: HexParsing.hex(payload),
+            value: evaluated,
+            unit: def.unit,
+            displayName: def.displayName,
+            category: def.category,
+            samplingRate: rate,
+            timestamp: Date.now
+        )
     }
 
     private func dedupeByQuery(_ pids: [PidDef]) -> [(mode: String, pid: String, defs: [PidDef])] {
@@ -321,24 +452,59 @@ public final class Sampler {
     private func extractPayload(response: String, mode: String, pid: String) -> [UInt8]? {
         guard let modeByte = UInt8(mode, radix: 16) else { return nil }
         let prefix = String(format: "%02X%@", modeByte + 0x40, pid.uppercased())
-        let lines = response.uppercased()
-            .components(separatedBy: .whitespacesAndNewlines)
-            .map { $0.trimmingCharacters(in: .whitespaces).replacing( " ", with: "") }
-            .filter { !$0.isEmpty }
-            .map { line -> String in
-                if let colonIdx = line.firstIndex(of: ":"),
-                   line.distance(from: line.startIndex, to: colonIdx) <= 2,
-                   line[..<colonIdx].allSatisfy({ $0.isHexDigit }) {
-                    return String(line[line.index(after: colonIdx)...])
-                }
-                return line
-            }
-        
-        let concatenated = lines.joined()
-        if let prefixRange = concatenated.range(of: prefix) {
-            let after = String(concatenated[prefixRange.upperBound...])
+        let clean = response.uppercased().replacingOccurrences(of: " ", with: "")
+        if let prefixRange = clean.range(of: prefix) {
+            let after = String(clean[prefixRange.upperBound...])
             return HexParsing.bytes(after)
         }
         return nil
+    }
+
+    private func extractMultiPayloads(response: String, requestedPids: [String]) -> [String: [UInt8]]? {
+        let clean = response.uppercased().replacingOccurrences(of: " ", with: "")
+        guard clean.hasPrefix("41") else { return nil }
+        guard let allBytes = HexParsing.bytes(clean), allBytes.count >= 2, allBytes[0] == 0x41 else { return nil }
+
+        var result: [String: [UInt8]] = [:]
+        var i = 1
+        while i < allBytes.count {
+            let currentPidHex = String(format: "%02X", allBytes[i])
+            guard requestedPids.contains(currentPidHex) else {
+                i += 1
+                continue
+            }
+
+            // Déterminer la longueur attendue de ce PID (1, 2 ou 4 octets selon SAE J1979)
+            let length: Int = {
+                switch currentPidHex {
+                case "00", "20", "40", "60", "80", "A0", "C0": return 4
+                case "01": return 4 // Status since DTCs cleared (MIL / DTC count + monitors)
+                case "03": return 2 // Fuel system status
+                case "14", "15", "16", "17", "18", "19", "1A", "1B": return 2 // O2 sensors voltage / fuel trim
+                case "0C", "10", "1F", "21", "22", "23", "31", "32", "3C", "3D", "3E", "3F", "42", "43", "44", "4D", "4E", "53", "54", "59", "5C", "5D", "5E", "63": return 2
+                case "4F", "50", "51", "52": return 4
+                default: return 1
+                }
+            }()
+
+            let payloadStart = i + 1
+            let payloadEnd = payloadStart + length
+            if payloadEnd <= allBytes.count {
+                result[currentPidHex] = Array(allBytes[payloadStart..<payloadEnd])
+                i = payloadEnd
+            } else {
+                break
+            }
+        }
+
+        return result.isEmpty ? nil : result
+    }
+}
+
+private extension Array {
+    func chunked(into size: Int) -> [[Element]] {
+        stride(from: 0, to: count, by: size).map {
+            Array(self[$0 ..< Swift.min($0 + size, count)])
+        }
     }
 }

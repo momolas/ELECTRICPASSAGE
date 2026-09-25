@@ -23,39 +23,74 @@ public final class BusCoordinator: Sendable {
     public private(set) var activePriority: BusPriority = .background
     public private(set) var isBusy: Bool = false
 
-    private var lockHolderCount = 0
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private struct Waiter {
+        let priority: BusPriority
+        let sequence: UInt64
+        let name: String
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private var sequenceCounter: UInt64 = 0
+    private var waiters: [Waiter] = []
+    private var activeDepth: Int = 0
 
     public init() {}
 
     /// Tente ou attend l'acquisition du bus pour une opération critique.
+    /// Garantit l'exclusion mutuelle stricte : aucune tâche concurrente ne peut s'exécuter sur le bus.
+    /// Les tâches en attente sont réveillées par ordre décroissant de priorité (criticalExclusive > interactive > background)
+    /// et selon un ordonnancement FIFO strict au sein d'un même échelon de priorité.
     public func acquire(priority: BusPriority = .interactive, name: String) async {
-        while isBusy && priority <= activePriority {
-            await withCheckedContinuation { continuation in
-                waiters.append(continuation)
+        if isBusy {
+            if activeSessionName == name {
+                // Réentrance autorisée pour la même session
+                activeDepth += 1
+                return
             }
-        }
 
-        isBusy = true
-        activePriority = priority
-        activeSessionName = name
-        lockHolderCount += 1
+            await withCheckedContinuation { continuation in
+                sequenceCounter += 1
+                let waiter = Waiter(priority: priority, sequence: sequenceCounter, name: name, continuation: continuation)
+                waiters.append(waiter)
+                waiters.sort {
+                    if $0.priority != $1.priority {
+                        return $0.priority > $1.priority
+                    }
+                    return $0.sequence < $1.sequence
+                }
+            }
+            // En réveil par passage direct (direct lock handoff), isBusy reste true
+            // et les métadonnées de session ont été assignées immédiatement lors du release().
+        } else {
+            isBusy = true
+            activePriority = priority
+            activeSessionName = name
+            activeDepth = 0
+        }
     }
 
-    /// Libère l'accès au bus et réveille les tâches en attente.
+    /// Libère l'accès au bus et transmet directement le verrou à la tâche la plus prioritaire en attente (Direct Lock Handoff).
+    /// Empêche toute interception/préemption intempestive (barge-in) et élimine les inversions de priorité.
     public func release() {
-        guard lockHolderCount > 0 else { return }
-        lockHolderCount -= 1
+        guard isBusy else { return }
 
-        if lockHolderCount == 0 {
+        if activeDepth > 0 {
+            activeDepth -= 1
+            return
+        }
+
+        if !waiters.isEmpty {
+            let next = waiters.removeFirst()
+            // Direct lock handoff : isBusy reste true, passage de propriété immédiat
+            activePriority = next.priority
+            activeSessionName = next.name
+            activeDepth = 0
+            next.continuation.resume()
+        } else {
             isBusy = false
             activeSessionName = nil
             activePriority = .background
-
-            if !waiters.isEmpty {
-                let next = waiters.removeFirst()
-                next.resume()
-            }
+            activeDepth = 0
         }
     }
 
@@ -65,10 +100,12 @@ public final class BusCoordinator: Sendable {
         name: String,
         operation: @MainActor () async throws -> T
     ) async throws -> T {
+        try Task.checkCancellation()
         await acquire(priority: priority, name: name)
         defer {
             release()
         }
+        try Task.checkCancellation()
         return try await operation()
     }
 }

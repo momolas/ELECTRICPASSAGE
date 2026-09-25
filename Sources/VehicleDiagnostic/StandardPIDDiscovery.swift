@@ -34,6 +34,12 @@ public enum StandardPIDDiscovery {
                 }
             }
 
+            // Le 32e bit (0x00000001) indique si la plage suivante (nextRange + 0x20) est supportée (SAE J1979)
+            let hasNextRange = (bitmap & 0x00000001) != 0
+            if !hasNextRange {
+                break
+            }
+
             nextRange += 0x20
         }
 
@@ -44,13 +50,13 @@ public enum StandardPIDDiscovery {
     private static func parseBitmap(response: String, requestedPid: Int) -> UInt32? {
         guard let bytes = HexParsing.bytes(
             response
-                .replacing( " ", with: "")
-                .replacing( "\n", with: "")
-                .replacing( "\r", with: "")
-        ) else { return nil }
+                .replacing(" ", with: "")
+                .replacing("\n", with: "")
+                .replacing("\r", with: "")
+        ), bytes.count >= 6 else { return nil }
 
         let pp = UInt8(requestedPid)
-        for i in 0..<(bytes.count - 5) {
+        for i in 0...(bytes.count - 6) {
             if bytes[i] == 0x41 && bytes[i + 1] == pp {
                 let b0 = UInt32(bytes[i + 2])
                 let b1 = UInt32(bytes[i + 3])

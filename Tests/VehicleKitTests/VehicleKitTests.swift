@@ -37,7 +37,7 @@ struct VehicleKitTests {
         #expect(keyXor == "486E")
 
         let keyRenault = SecurityAccessManager.calculateKey(seedHex: "12 34", algorithm: .renaultStandard, maskHex: "5A 5A")
-        #expect(!keyRenault.isEmpty)
+        #expect(keyRenault.isEmpty == false)
     }
 
     @Test("ISO-TP Multi-Frame Reassembly")
@@ -102,7 +102,7 @@ struct VehicleKitTests {
 
         let payload = Data([0xFF, 0x00, 0x7D, 0x00, 0x20, 0xFF, 0xFF, 0xFF]) // Torque: 125-125=0%, RPM: 8192*0.125 = 1024 rpm
         let signals = J1939Decoder.decode(pgn: header.pgn, data: payload)
-        #expect(!signals.isEmpty)
+        #expect(signals.isEmpty == false)
         if let rpmSignal = signals.first(where: { $0.spn == 190 }) {
             #expect(rpmSignal.value == 1024.0)
         }
@@ -198,8 +198,11 @@ struct VehicleKitTests {
         #expect(DTCDecoder.decodeSingleDTC("4101") == "C0101")
         #expect(DTCDecoder.decodeSingleDTC("8100") == "B0100")
 
-        let dtcs = DTCDecoder.decodeDTCList(from: "43 02 01 02 03 00")
-        #expect(dtcs == ["P0102", "P0300"])
+        let dtcsStandard = DTCDecoder.decodeDTCList(from: "43 01 02 03 00")
+        #expect(dtcsStandard == ["P0102", "P0300"])
+
+        let dtcsLegacy = DTCDecoder.decodeDTCList(from: "43 02 01 02 03 00")
+        #expect(dtcsLegacy == ["P0102", "P0300"])
 
         let statusPresent = DTCDecoder.decodeKwpDtcStatus(0x80)
         #expect(statusPresent.contains("Présent"))
@@ -208,15 +211,15 @@ struct VehicleKitTests {
     @Test("KWP2000 Client Session & Services")
     func testKWP2000Client() async throws {
         let sim = SimulatorEngine()
-        let client = await KWP2000Client(interface: sim)
+        let client = KWP2000Client(interface: sim)
 
         let sessionResp = try await client.startSession(mode: 0x85)
         #expect(sessionResp.hasPrefix("5085"))
 
         let lidData = try await client.readLocalIdentifier(lid: 0x00)
-        #expect(!lidData.isEmpty)
+        #expect(lidData.isEmpty == false)
 
-        await client.stop()
+        await client.stopTesterPresent()
     }
 
     @Test("VIN Reader & Decoders (OBD2, UDS, KWP2000)")
@@ -275,8 +278,8 @@ struct VehicleKitTests {
         let mask = DTCStatusMask(rawValue: 0x2F) // testFailed(01), testFailedThisOperationCycle(02), pending(04), confirmed(08), testFailedSinceLastClear(20)
         #expect(mask.contains(.testFailed))
         #expect(mask.contains(.confirmedDTC))
-        #expect(!mask.contains(.warningIndicatorRequested))
-        #expect(!mask.summary.isEmpty)
+        #expect(mask.contains(.warningIndicatorRequested) == false)
+        #expect(mask.summary.isEmpty == false)
 
         // UDS 0x19 02 Response: 59 02 FF (010200 2F)
         let udsPayload = "59 02 FF 01 02 00 2F"
@@ -433,7 +436,7 @@ struct VehicleKitTests {
     @MainActor
     func testBusCoordinator() async {
         let coordinator = BusCoordinator()
-        #expect(!coordinator.isBusy)
+        #expect(coordinator.isBusy == false)
 
         await coordinator.acquire(priority: .interactive, name: "Live Data")
         #expect(coordinator.isBusy)
@@ -441,7 +444,7 @@ struct VehicleKitTests {
         #expect(coordinator.activeSessionName == "Live Data")
 
         coordinator.release()
-        #expect(!coordinator.isBusy)
+        #expect(coordinator.isBusy == false)
     }
 
     @Test("RegistryBuilder Combine PIDs")
@@ -466,26 +469,457 @@ struct VehicleKitTests {
         #expect(combined.contains(where: { $0.id == "custom_oil_temp" }))
     }
 
-    // MARK: - Apple Accelerate & Signal Processing Tests
+    @Test("Standard PID Discovery Safety & Non-Crash on Short Frames")
+    func testStandardPIDDiscoverySafety() async throws {
+        // Mock driver qui renvoie d'abord un NRC court (3 octets) pour tester l'absence de crash
+        actor ShortFrameDriver: VehicleInterface {
+            var calls = 0
+            func sendDiagnosticRequest(_ requestHex: String, timeout: TimeInterval) async throws -> String {
+                calls += 1
+                if requestHex.contains("0100") {
+                    return "41 00 BE 3E B8 11" // Range 00 avec bit 31=1
+                } else if requestHex.contains("0120") {
+                    return "7F 01 11" // NRC 3 octets (provoquait un crash 0 ..< -2)
+                }
+                return "7F 01 12"
+            }
+            func setTarget(txID: String, rxID: String?) async throws {}
+        }
 
-    @Test("Accelerate vs Scalar Pearson Equivalence")
-    func testPearsonEquivalence() {
-        let xs = [1.2, 2.5, 3.8, 4.1, 5.9, 6.4, 7.8, 8.2]
-        let ys = [2.4, 5.1, 7.6, 8.3, 11.7, 12.9, 15.7, 16.5]
-        
-        let scalarR = SignalCorrelator.scalarPearson(x: xs, y: ys)
-        let standardR = SignalCorrelator.pearsonCorrelation(x: xs, y: ys)
-
-        #expect(scalarR != nil)
-        #expect(standardR != nil)
-        #expect(abs((scalarR ?? 0) - (standardR ?? 0)) < 1e-5)
-
-        #if canImport(Accelerate)
-        let accelR = SignalCorrelator.acceleratedPearson(x: xs, y: ys)
-        #expect(accelR != nil)
-        #expect(abs((accelR ?? 0) - (scalarR ?? 0)) < 1e-5)
-        #endif
+        let driver = ShortFrameDriver()
+        let discovered = try await StandardPIDDiscovery.discover(driver: driver)
+        #expect(discovered.isEmpty == false)
+        #expect(discovered.contains("0C")) // RPM supporté
     }
+
+    @Test("Simulator Engine Enhanced Services & Renault Offset")
+    func testSimulatorEngineEnhanced() async throws {
+        let sim = SimulatorEngine()
+
+        // 1. Test Renault Rx ID calculation avec préfixe "0x" (0x745 + 0x20 = 765)
+        try await sim.setTarget(txID: "0x745", rxID: nil)
+        let stateEcho = try await sim.sendDiagnosticRequest("210C")
+        #expect(stateEcho.hasPrefix("61 0C"))
+
+        // 2. Test LID 0C exact echo (RPM)
+        let lid0C = try await sim.sendDiagnosticRequest("210C")
+        #expect(lid0C.hasPrefix("61 0C"))
+
+        // 3. Test OBD-II Mode 03 / Mode 07 DTCs (SAE J1979 sans octet de compte)
+        let dtcResp = try await sim.sendDiagnosticRequest("03")
+        #expect(dtcResp.contains("43 01"))
+
+        // 4. Test OBD-II Mode 04 Clear DTCs
+        let clearResp = try await sim.sendDiagnosticRequest("04")
+        #expect(clearResp == "44")
+
+        // 5. Test OBD-II Mode 09 VIN
+        let vinResp = try await sim.sendDiagnosticRequest("0902")
+        #expect(vinResp.contains("49 02"))
+        let decodedVIN = VINReader.parseOBD2VIN(vinResp)
+        #expect(decodedVIN == "VF1JM0G0D12345678")
+
+        // 6. Test SecurityAccess Seed & Key
+        let seedResp = try await sim.sendDiagnosticRequest("2701")
+        #expect(seedResp.hasPrefix("6701"))
+        let keyResp = try await sim.sendDiagnosticRequest("2702")
+        #expect(keyResp == "6702")
+
+        // 7. Test KWP2000Client with LID 0C
+        let kwp = KWP2000Client(interface: sim)
+        let rpmData = try await kwp.readLocalIdentifier(lid: 0x0C)
+        #expect(rpmData.isEmpty == false)
+        await kwp.stopTesterPresent()
+    }
+
+    @Test("OBD2Analyzer Integration with FormulaEvaluator")
+    func testOBD2AnalyzerFormulas() {
+        // PID 06: Short Term Fuel Trim (A*100/128 - 100)
+        // 0x80 (128) -> 128*100/128 - 100 = 0 %
+        let stftResp = OBD2Analyzer.decodeResponse(request: "0106", response: "41 06 80")
+        #expect(stftResp?.contains("0 %") == true)
+
+        // PID 0A: Fuel Pressure (A*3)
+        // 0x20 (32) -> 32 * 3 = 96 kPa
+        let pressResp = OBD2Analyzer.decodeResponse(request: "010A", response: "41 0A 20")
+        #expect(pressResp?.contains("96 kPa") == true)
+
+        // PID 23: Fuel Rail Pressure ((A*256+B)*10)
+        // 0x01, 0x00 (256) -> 2560 kPa
+        let railResp = OBD2Analyzer.decodeResponse(request: "0123", response: "41 23 01 00")
+        #expect(railResp?.contains("2560 kPa") == true)
+
+        // PID 61: Demanded Torque (A - 125)
+        // 0x7D (125) -> 0 %
+        let torqueResp = OBD2Analyzer.decodeResponse(request: "0161", response: "41 61 7D")
+        #expect(torqueResp?.contains("0 %") == true)
+    }
+
+    @Test("Apple Accelerate SignalCorrelator & Multi-Byte Slicing")
+    func testSignalCorrelatorAccelerateAndSlices() {
+        // 1. Validation de Pearson accéléré
+        let xs = [10.0, 20.0, 30.0, 40.0, 50.0]
+        let ys = [15.0, 25.0, 35.0, 45.0, 55.0]
+        let r = SignalCorrelator.pearsonCorrelation(x: xs, y: ys)
+        #expect(r != nil)
+        #expect(abs((r ?? 0.0) - 1.0) < 1e-6)
+
+        // 2. Validation des étiquettes de tranches sans collision > 26 octets
+        #expect(SignalCorrelator.sliceLabel(for: 0) == "A")
+        #expect(SignalCorrelator.sliceLabel(for: 25) == "Z")
+        #expect(SignalCorrelator.sliceLabel(for: 26) == "AA")
+        #expect(SignalCorrelator.sliceLabel(for: 27) == "AB")
+
+        // 3. Matrice de 30 octets sur 6 échantillons (au-delà des 26 octets)
+        var rows: [[UInt8]] = []
+        for i in 0..<6 {
+            var row = [UInt8](repeating: 0, count: 30)
+            row[0] = UInt8(i * 10)       // Tranche A
+            row[26] = UInt8(i * 20)      // Tranche AA (ne doit pas écraser A)
+            rows.append(row)
+        }
+
+        let ref: [String: [Double]] = ["REF": [0.0, 10.0, 20.0, 30.0, 40.0, 50.0]]
+        let slices = SignalCorrelator.correlateSlices(byteRows: rows, references: ref, minimumSamples: 6)
+
+        #expect(slices.contains(where: { $0.sliceName == "A" }))
+        #expect(slices.contains(where: { $0.sliceName == "AA" }))
+    }
+
+    @Test("BusCoordinator Strict Mutual Exclusion & Priority Queue")
+    @MainActor
+    func testBusCoordinatorStrictExclusion() async {
+        let coordinator = BusCoordinator()
+
+        // 1. Tâche 1 prend le bus
+        await coordinator.acquire(priority: .interactive, name: "Task 1")
+        #expect(coordinator.isBusy)
+        #expect(coordinator.activeSessionName == "Task 1")
+
+        // 2. Libération
+        coordinator.release()
+        #expect(coordinator.isBusy == false)
+        #expect(coordinator.activeSessionName == nil)
+    }
+
+    @Test("FormulaEvaluator AST Precompilation, Extended Functions & Batch Evaluation")
+    func testFormulaEvaluatorASTAndExtended() {
+        let evaluator = FormulaEvaluator()
+
+        // 1. Compilation AST explicite
+        let compiled = evaluator.compile(formula: "min(A, B) + 10")
+        #expect(compiled != nil)
+        #expect(compiled?.evaluate(bytes: [20, 50]) == 30.0)
+        #expect(compiled?.evaluate(bytes: [80, 15]) == 25.0)
+
+        // 2. Fonctions étendues : max, sqrt, abs, round
+        #expect(evaluator.evaluate(formula: "max(A, B)", bytes: [10, 42]) == 42.0)
+        #expect(evaluator.evaluate(formula: "sqrt(A)", bytes: [64]) == 8.0)
+        #expect(evaluator.evaluate(formula: "abs(A-100)", bytes: [75]) == 25.0)
+        #expect(evaluator.evaluate(formula: "round(A/4)", bytes: [10]) == 3.0)
+
+        // 3. Opérateur conditionnel ternaire (cond ? true : false)
+        #expect(evaluator.evaluate(formula: "A > 50 ? 1 : 0", bytes: [75]) == 1.0)
+        #expect(evaluator.evaluate(formula: "A > 50 ? 1 : 0", bytes: [25]) == 0.0)
+
+        // 4. Opérateurs logiques, comparaisons et précédence de grammaire
+        #expect(evaluator.evaluate(formula: "A > 50 AND B < 20", bytes: [60, 10]) == 1.0)
+        #expect(evaluator.evaluate(formula: "A > 50 AND B < 20", bytes: [40, 10]) == 0.0)
+        #expect(evaluator.evaluate(formula: "A == 0 || B == 42", bytes: [10, 42]) == 1.0)
+        #expect(evaluator.evaluate(formula: "A == 0 || B == 42", bytes: [10, 40]) == 0.0)
+        #expect(evaluator.evaluate(formula: "A & 15 == 3", bytes: [0x13]) == 1.0)
+
+        // 5. Opérateurs bitwise et décalages avec masque sécurisé
+        #expect(evaluator.evaluate(formula: "A << 2", bytes: [10]) == 40.0)
+        #expect(evaluator.evaluate(formula: "A >> 1", bytes: [40]) == 20.0)
+        #expect(evaluator.evaluate(formula: "!A", bytes: [0]) == 1.0)
+        #expect(evaluator.evaluate(formula: "!A", bytes: [10]) == 0.0)
+        #expect(evaluator.evaluate(formula: "~A", bytes: [0]) == -1.0)
+
+        // 6. Robustesse numérique (division par zéro, finitude)
+        #expect(evaluator.evaluate(formula: "1 / 0", bytes: []) == nil)
+
+        // 7. Batch evaluation
+        let frames: [[UInt8]] = (0..<100).map { [UInt8($0)] }
+        let batchResults = evaluator.evaluateBatch(formula: "A * 2", frames: frames)
+        #expect(batchResults.count == 100)
+        #expect(batchResults[50] == 100.0)
+    }
+
+    @Test("SimulatorEngine Dynamic Physics & Interactive Faults")
+    func testSimulatorEngineDynamicPhysicsAndFaults() async throws {
+        let engine = SimulatorEngine()
+
+        // 1. État initial au ralenti
+        let initial = await engine.getState()
+        #expect(initial.rpm == 750.0)
+        #expect(initial.throttlePercent == 0.0)
+
+        // 2. Accélération papillon à 80%
+        await engine.setThrottle(percent: 80.0)
+        await engine.stepSimulation(deltaSeconds: 0.5)
+
+        let runningState = await engine.getState()
+        #expect(runningState.rpm > 750.0)
+        #expect(runningState.intakeMapKpa > 35.0)
+        #expect(runningState.mafGPerSec > 3.5)
+
+        // 3. Injection et lecture de panne DTC
+        await engine.injectFault(dtc: "P0300")
+        let dtcResp = try await engine.sendDiagnosticRequest("03")
+        #expect(dtcResp.contains("43"))
+        #expect(dtcResp.contains("03 00")) // P0300
+
+        // 4. Effacement via Mode 04
+        let clearResp = try await engine.sendDiagnosticRequest("04")
+        #expect(clearResp == "44")
+        let clearedState = await engine.getState()
+        #expect(clearedState.activeDTCs.isEmpty)
+        #expect(clearedState.milActive == false)
+    }
+
+    @Test("SimulatorEngine Multi-PID Response Decoding")
+    func testSimulatorEngineMultiPIDResponses() async throws {
+        let engine = SimulatorEngine()
+
+        // Requête multi-PIDs SAE J1979 : Régime (0C) + Vitesse (0D) + Charge (04)
+        let resp = try await engine.sendDiagnosticRequest("01 0C 0D 04")
+        #expect(resp.hasPrefix("41"))
+        #expect(resp.contains("0C"))
+        #expect(resp.contains("0D"))
+        #expect(resp.contains("04"))
+    }
+
+    @Test("SignalCorrelator Cross-Correlation Time-Lag (Turbo Lag)")
+    func testSignalCorrelatorTimeLag() {
+        // Stimulus (ex: commande pédale)
+        let x: [Double] = [0, 0, 10, 40, 80, 100, 100, 90, 50, 20, 0, 0, 0, 0]
+        // Réponse retardée exactement de 2 échantillons (ex: pression turbo)
+        let y: [Double] = [0, 0, 0, 0, 10, 40, 80, 100, 100, 90, 50, 20, 0, 0]
+
+        let result = SignalCorrelator.crossCorrelationWithLag(x: x, y: y, maxLag: 4)
+        #expect(result.bestLag == 2)
+        #expect(result.bestCorrelation > 0.95)
+    }
+
+    @Test("PowertrainCalculations Power, Torque, Fuel & Volumetric Efficiency")
+    func testPowertrainCalculations() {
+        // 1. Puissance : 200 N.m à 3000 RPM -> ~62.83 kW (~85.4 ch)
+        let (kw, hp) = PowertrainCalculations.instantaneousPower(torqueNm: 200.0, rpm: 3000.0)
+        #expect(abs(kw - 62.83) < 0.1)
+        #expect(abs(hp - 85.4) < 0.2)
+
+        // 2. Couple réciproque
+        let torque = PowertrainCalculations.instantaneousTorque(powerKw: kw, rpm: 3000.0)
+        #expect(abs(torque - 200.0) < 0.1)
+
+        // 3. Consommation : 15 g/s MAF à 90 km/h (essence)
+        let (lPerHour, lPer100Km) = PowertrainCalculations.instantaneousFuelConsumption(
+            mafGPerSec: 15.0,
+            speedKmh: 90.0
+        )
+        #expect(lPerHour > 0.0)
+        #expect(lPer100Km != nil)
+        if let cons = lPer100Km {
+            #expect(cons > 3.0 && cons < 8.0) // ~4.93 L/100km
+        }
+
+        // 4. Rendement volumétrique VE % (moteur 1.6L à 3000 RPM)
+        let ve = PowertrainCalculations.volumetricEfficiency(
+            mafGPerSec: 25.0,
+            rpm: 3000.0,
+            mapKpa: 100.0,
+            iatCelsius: 25.0,
+            displacementLiters: 1.6
+        )
+        #expect(ve != nil)
+        if let v = ve {
+            #expect(v > 50.0 && v < 120.0)
+        }
+    }
+
+    @Test("Sampler Actor & Multi-PID Acquisition Stream")
+    func testSamplerActorAndMultiPIDStream() async throws {
+        let engine = SimulatorEngine()
+        let pids: [PidDef] = [
+            try #require(StandardPids.get("0C")), // RPM
+            try #require(StandardPids.get("0D")), // Speed
+            try #require(StandardPids.get("04")), // Load
+            try #require(StandardPids.get("05"))  // Temp
+        ]
+        let ecus: [String: EcuDef] = [
+            "engine": EcuDef(requestHeader: "7E0", responseHeader: "7E8")
+        ]
+
+        let sampler = Sampler(
+            driver: engine,
+            pids: pids,
+            ecus: ecus,
+            baseLoopRateHz: 10.0,
+            customRates: ["engine_load": .fast, "coolant_temp": .fast],
+            sessionStartMs: 0
+        )
+
+        // 1. Exécution d'un tick d'échantillonnage multi-PID
+        let row = await sampler.runOneTick()
+        #expect(row.values["rpm"] != nil)
+        #expect(row.values["speed"] != nil)
+        #expect(row.values["engine_load"] != nil)
+        #expect(row.values["coolant_temp"] != nil)
+
+        // 2. Démarrage et arrêt de la boucle asynchrone sans blocage
+        await sampler.start()
+        try? await Task.sleep(nanoseconds: 50_000_000) // 50 ms
+        let ticks = await sampler.tickCount
+        #expect(ticks >= 1)
+        await sampler.stop()
+    }
+
+    @Test("Hardening Swarm Fixes: Direct Lock Handoff, Anti-Correlation & Atomic Transactions")
+    @MainActor
+    func testHardeningSwarmFixes() async throws {
+        // 1. BusCoordinator Direct Lock Handoff & Priority Order
+        let coordinator = BusCoordinator()
+        await coordinator.acquire(priority: .interactive, name: "Initial Task")
+        #expect(coordinator.isBusy == true)
+
+        var executionOrder: [String] = []
+
+        let taskCritical = Task { @MainActor in
+            await coordinator.acquire(priority: .criticalExclusive, name: "Flash Routine")
+            executionOrder.append("Flash Routine")
+            coordinator.release()
+        }
+
+        let taskInteractive = Task { @MainActor in
+            await coordinator.acquire(priority: .interactive, name: "Diagnostics")
+            executionOrder.append("Diagnostics")
+            coordinator.release()
+        }
+
+        // Céder brièvement pour laisser les tâches s'enregistrer dans waiters
+        await Task.yield()
+
+        // Release initiale : passage direct à la tâche critique sans passer par isBusy = false
+        coordinator.release()
+        #expect(coordinator.isBusy == true) // Maintenu par Direct Lock Handoff
+        #expect(coordinator.activePriority == .criticalExclusive)
+        #expect(coordinator.activeSessionName == "Flash Routine")
+
+        _ = await taskCritical.result
+        _ = await taskInteractive.result
+
+        #expect(executionOrder == ["Flash Routine", "Diagnostics"])
+        #expect(coordinator.isBusy == false)
+
+        // 2. SignalCorrelator Anti-Correlation avec Lag
+        // Signal de commande et réponse physique inversée décalée de 2 échantillons
+        let stimulus: [Double] = [0, 0, 10, 40, 80, 100, 100, 90, 50, 20, 0, 0, 0, 0]
+        let invertedDelayed: [Double] = [0, 0, 0, 0, -10, -40, -80, -100, -100, -90, -50, -20, 0, 0] // Lag de +2 échantillons, r ~ -1.0
+        let lagResult = SignalCorrelator.crossCorrelationWithLag(x: stimulus, y: invertedDelayed, maxLag: 4)
+        #expect(lagResult.bestCorrelation < -0.95)
+        #expect(lagResult.bestLag == 2)
+
+        // 3. KWP2000Client Atomic Transaction
+        let sim = SimulatorEngine()
+        let kwp = KWP2000Client(interface: sim)
+        try await kwp.withAtomicTransaction {
+            // Durant cette transaction, TesterPresent doit être strictement neutralisé
+            try await kwp.sendTesterPresent(suppressResponse: true)
+        }
+        await kwp.stopTesterPresent()
+
+        // 4. FormulaEvaluator Masking Shifts & Safe Finitude
+        let evaluator = FormulaEvaluator()
+        let shiftResult = evaluator.evaluate(formula: "A << 66", bytes: [1]) // 66 & 63 = 2 -> 1 << 2 = 4
+        #expect(shiftResult == 4.0)
+        let sqrtNegative = evaluator.evaluate(formula: "sqrt(0 - 4)", bytes: [])
+        #expect(sqrtNegative == nil)
+    }
+
+    @MainActor
+    @Test("Swift Bug Pro Fixes: ISOTP Subslice, ProfileProbe Overflow, 0x Hex Sanitization & UDS Atomic Keepalive")
+    func testSwiftBugProFixes() async throws {
+        // 1. ISOTPReassembler avec Data slice (startIndex > 0)
+        let reassembler = ISOTPReassembler()
+        let rawBuffer = Data([0xAA, 0x55, 0x03, 0x22, 0x01, 0x02, 0x00, 0x00])
+        let slicedFrame = rawBuffer.dropFirst(2)
+        #expect(slicedFrame.startIndex == 2)
+        let isotpResult = await reassembler.processFrame(address: 0x7E8, data: slicedFrame)
+        #expect(isotpResult == .completed(Data([0x22, 0x01, 0x02])))
+
+        // 2. ProfileProbe : protection contre le débordement sur mode >= 0xC0
+        let profile = Profile(
+            profileId: "overflow_test",
+            profileVersion: "1.0",
+            displayName: "Overflow Test Profile",
+            vehicleMatch: nil,
+            ecus: ["ECM": EcuDef(requestHeader: "7E0", responseHeader: "7E8")],
+            pids: [
+                PidDef(
+                    id: "routine_c0",
+                    displayName: "Routine C0",
+                    ecu: "ECM",
+                    mode: "C0", // 0xC0 = 192 (192 + 0x40 = 256 > 255 sans crash)
+                    pid: "01",
+                    unit: "",
+                    formula: "A",
+                    category: .other
+                )
+            ]
+        )
+        let sim = SimulatorEngine()
+        let probeResult = try await ProfileProbe.probe(driver: sim, profile: profile)
+        #expect(probeResult.isEmpty) // Mode C0 non reconnu en OBD2 mais aucun crash arithmétique
+
+        // 3. DoIPClient & PandaDriver : assainissement du préfixe "0x"
+        let doip = DoIPClient()
+        try await doip.connect()
+        try await doip.setTarget(txID: "0x17FC", rxID: "0x17FD")
+        let doipResp = try await doip.sendDiagnosticRequest("1001")
+        #expect(doipResp == "5001")
+        await doip.disconnect()
+
+        let panda = PandaDriver()
+        try await panda.connect()
+        try await panda.setTarget(txID: "0x745", rxID: nil)
+        await panda.disconnect()
+
+        // 4. UDSClient : Transaction atomique et isolation
+        let udsSim = SimulatorEngine()
+        let udsClient = UDSClient(interface: udsSim)
+        let atomicRes = try await udsClient.withAtomicTransaction {
+            try await udsSim.sendDiagnosticRequest("1001", timeout: 1.0)
+        }
+        #expect(atomicRes.contains("5001"))
+        await udsClient.stop()
+
+        // 5. CANProtocolDetector : plage 0x740...0x77F classifiée en KWP2000
+        let classificationUCH = CANProtocolDetector.detect(canID: 0x745, payload: Data([0x02, 0x21, 0x81]))
+        #expect(classificationUCH.protocolType == .kwp2000)
+
+        // 6. BusCoordinator : réentrance autorisée sur la même session
+        let coordinator = BusCoordinator.shared
+        try await coordinator.withExclusiveAccess(priority: .criticalExclusive, name: "Reentrant Flasher") {
+            #expect(coordinator.isBusy == true)
+            // Appel réentrant imbriqué avec le même nom de session
+            try await coordinator.withExclusiveAccess(priority: .criticalExclusive, name: "Reentrant Flasher") {
+                #expect(coordinator.isBusy == true)
+            }
+            #expect(coordinator.isBusy == true)
+        }
+        #expect(coordinator.isBusy == false)
+
+        // 7. DoIPHeader : décodage sur Data slice avec startIndex > 0
+        let fullDoIP = Data(repeating: 0xEE, count: 16) + Data([0x02, 0xFD, 0x80, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03])
+        let slicedDoIP = fullDoIP.dropFirst(16)
+        #expect(slicedDoIP.startIndex == 16)
+        let decodedDoIP = DoIPMessage.decode(from: slicedDoIP)
+        #expect(decodedDoIP != nil)
+        #expect(decodedDoIP?.payload.count == 3)
+    }
+
+    // MARK: - DSP & Signal Filtering Tests
 
     @Test("Biquad IIR Low-Pass & Median Filter")
     func testSignalFilter() {

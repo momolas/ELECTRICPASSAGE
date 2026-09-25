@@ -7,7 +7,6 @@ public enum ProfileProbe: Sendable {
 
     /// Teste chaque PID du profil en direct sur l'interface véhicule.
     /// Retourne la liste des identifiants (`pids[].id`) qui reçoivent une réponse positive.
-    @MainActor
     public static func probe(driver: VehicleInterface, profile: Profile) async throws -> [String] {
         var supported: [String] = []
         var grouped: [String: [PidDef]] = [:]
@@ -50,7 +49,7 @@ public enum ProfileProbe: Sendable {
     }
 
     private static func positiveResponseCode(mode: String, pid: String) throws -> String {
-        guard let modeByte = UInt8(mode, radix: 16) else { return "" }
+        guard let modeByte = UInt8(mode, radix: 16), modeByte <= 0xBF else { return "" }
         let positive = modeByte + 0x40
         return String(format: "%02X%@", positive, pid)
     }

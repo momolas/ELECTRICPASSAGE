@@ -7,7 +7,6 @@ public enum ECULiveness: Sendable {
 
     /// Retourne true si l'ECU répond positivement à la requête `0100` (`41 00 ...`).
     /// Retourne false en cas de timeout, NO_DATA, STOPPED ou réveil incomplet.
-    @MainActor
     public static func check(driver: VehicleInterface, timeout: TimeInterval = 4.0) async throws -> Bool {
         let response: String
         do {
