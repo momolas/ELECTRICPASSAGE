@@ -70,13 +70,22 @@ public actor CANIntrusionDetector {
 
     /// Enregistre une trame CAN et évalue la sécurité du bus
     public func ingest(frame: CANSampleFrame) -> BusAnomalyReport {
+        guard frame.timestampSeconds.isFinite, frame.timestampSeconds >= 0 else {
+            return evaluateSecurity()
+        }
+
         frameBuffer.append(frame)
         if frameBuffer.count > windowSize {
-            frameBuffer.removeFirst()
+            let evicted = frameBuffer.removeFirst()
+            // Si l'identifiant n'est plus présent dans la fenêtre glissante, purger son état
+            if !frameBuffer.contains(where: { $0.canID == evicted.canID }) {
+                idLastTimestamp.removeValue(forKey: evicted.canID)
+                idIntervals.removeValue(forKey: evicted.canID)
+            }
         }
 
         // Calcul des intervalles inter-trames par ID
-        if let lastT = idLastTimestamp[frame.canID] {
+        if let lastT = idLastTimestamp[frame.canID], lastT.isFinite {
             let dt = frame.timestampSeconds - lastT
             if dt > 0 {
                 idIntervals[frame.canID, default: []].append(dt)

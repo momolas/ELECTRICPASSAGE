@@ -78,53 +78,62 @@ public enum OdometerFraudAuditor: Sendable {
         if let absKm = input.absMileageKm { allKnownMileages.append(absKm) }
         if let tcuKm = input.transmissionMileageKm { allKnownMileages.append(tcuKm) }
 
-        let minKm = allKnownMileages.min() ?? input.clusterMileageKm
-        let maxKm = allKnownMileages.max() ?? input.clusterMileageKm
+        let validKnownMileages = allKnownMileages.filter { $0.isFinite && $0 >= 0 }
+        let minKm = validKnownMileages.min() ?? input.clusterMileageKm
+        let maxKm = validKnownMileages.max() ?? input.clusterMileageKm
         let spread = maxKm - minKm
 
+        func formatDelta(_ delta: Double) -> String {
+            guard delta.isFinite, delta >= 0, delta <= 10_000_000.0 else { return "N/A" }
+            return "\(Int(delta.rounded()))"
+        }
+
         // 1. Contrôle de cohérence Multi-ECU
-        if let ecuKm = input.engineECUMileageKm, ecuKm > input.clusterMileageKm + 500.0 {
+        if let ecuKm = input.engineECUMileageKm, ecuKm.isFinite, input.clusterMileageKm.isFinite, ecuKm > input.clusterMileageKm + 500.0 {
             let delta = ecuKm - input.clusterMileageKm
-            anomalies.append("Calculateur Moteur supérieur au Combiné (+ \(Int(delta)) km)")
+            anomalies.append("Calculateur Moteur supérieur au Combiné (+ \(formatDelta(delta)) km)")
             riskScore += 0.45
         }
-        if let absKm = input.absMileageKm, absKm > input.clusterMileageKm + 500.0 {
+        if let absKm = input.absMileageKm, absKm.isFinite, input.clusterMileageKm.isFinite, absKm > input.clusterMileageKm + 500.0 {
             let delta = absKm - input.clusterMileageKm
-            anomalies.append("Calculateur ABS supérieur au Combiné (+ \(Int(delta)) km)")
+            anomalies.append("Calculateur ABS supérieur au Combiné (+ \(formatDelta(delta)) km)")
             riskScore += 0.45
         }
-        if let tcuKm = input.transmissionMileageKm, tcuKm > input.clusterMileageKm + 500.0 {
+        if let tcuKm = input.transmissionMileageKm, tcuKm.isFinite, input.clusterMileageKm.isFinite, tcuKm > input.clusterMileageKm + 500.0 {
             let delta = tcuKm - input.clusterMileageKm
-            anomalies.append("Boîte de vitesses supérieure au Combiné (+ \(Int(delta)) km)")
+            anomalies.append("Boîte de vitesses supérieure au Combiné (+ \(formatDelta(delta)) km)")
             riskScore += 0.40
         }
 
         // 2. Contrôle du FAP / DPF (dernière régénération enregistrée)
-        if let dpfKm = input.dpfLastRegenerationKm, dpfKm > input.clusterMileageKm + 50.0 {
+        if let dpfKm = input.dpfLastRegenerationKm, dpfKm.isFinite, input.clusterMileageKm.isFinite, dpfKm > input.clusterMileageKm + 50.0 {
             let delta = dpfKm - input.clusterMileageKm
-            anomalies.append("Dernière régénération FAP post-date le compteur (+ \(Int(delta)) km)")
+            anomalies.append("Dernière régénération FAP post-date le compteur (+ \(formatDelta(delta)) km)")
             riskScore += 0.50
         }
 
         // 3. Contrôle des Freeze Frames mémorisées dans les DTCs
-        for ffKm in input.freezeFrameMileages where ffKm > input.clusterMileageKm + 20.0 {
+        for ffKm in input.freezeFrameMileages where ffKm.isFinite && input.clusterMileageKm.isFinite && ffKm > input.clusterMileageKm + 20.0 {
             let delta = ffKm - input.clusterMileageKm
-            anomalies.append("Freeze Frame de défaut figée à un kilométrage supérieur (+ \(Int(delta)) km)")
+            anomalies.append("Freeze Frame de défaut figée à un kilométrage supérieur (+ \(formatDelta(delta)) km)")
             riskScore += 0.60
             break
         }
 
         // 4. Contrôle Heures Moteur vs Vitesse Moyenne Historique
         var avgSpeed: Double? = nil
-        if let hours = input.engineHours, hours > 10.0 {
+        if let hours = input.engineHours, hours.isFinite, hours > 10.0, hours <= 50_000.0, input.clusterMileageKm.isFinite, input.clusterMileageKm >= 0 {
             let speed = input.clusterMileageKm / hours
-            avgSpeed = speed
-            if speed < 12.0 {
-                anomalies.append("Vitesse moyenne anormalement basse (\(String(format: "%.1f", speed)) km/h sur \(Int(hours)) h), suspicion de recul")
-                riskScore += 0.25
-            } else if speed > 115.0 {
-                anomalies.append("Vitesse moyenne anormalement haute (\(String(format: "%.1f", speed)) km/h sur \(Int(hours)) h)")
-                riskScore += 0.20
+            if speed.isFinite {
+                avgSpeed = speed
+                let formattedHours = String(format: "%.0f", hours)
+                if speed < 12.0 {
+                    anomalies.append("Vitesse moyenne anormalement basse (\(String(format: "%.1f", speed)) km/h sur \(formattedHours) h), suspicion de recul")
+                    riskScore += 0.25
+                } else if speed > 115.0 {
+                    anomalies.append("Vitesse moyenne anormalement haute (\(String(format: "%.1f", speed)) km/h sur \(formattedHours) h)")
+                    riskScore += 0.20
+                }
             }
         }
 
@@ -138,8 +147,8 @@ public enum OdometerFraudAuditor: Sendable {
         }()
 
         // Estimation du kilométrage réel : maximum vérifié entre tous les calculateurs et freeze frames
-        var candidateRealMileages = allKnownMileages + input.freezeFrameMileages
-        if let dpfKm = input.dpfLastRegenerationKm { candidateRealMileages.append(dpfKm) }
+        var candidateRealMileages = (allKnownMileages + input.freezeFrameMileages).filter { $0.isFinite && $0 >= 0 }
+        if let dpfKm = input.dpfLastRegenerationKm, dpfKm.isFinite, dpfKm >= 0 { candidateRealMileages.append(dpfKm) }
         let estimatedReal = candidateRealMileages.max() ?? input.clusterMileageKm
 
         return FraudAuditReport(

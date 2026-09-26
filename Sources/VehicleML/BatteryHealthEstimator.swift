@@ -49,8 +49,31 @@ public enum BatteryHealthEstimator: Sendable {
         estimatedCrankingAmps: Double = 220.0,
         temperatureCelsius: Double = 20.0
     ) -> BatteryHealthReport {
+        guard restingVoltage.isFinite, minimumCrankingVoltage.isFinite,
+              restingVoltage > 0.0, minimumCrankingVoltage > 0.0 else {
+            return BatteryHealthReport(
+                stateOfHealthPercent: 0.0,
+                internalResistanceMilliOhms: 999.0,
+                restingVoltage: restingVoltage.isFinite ? restingVoltage : 0.0,
+                minimumCrankingVoltage: minimumCrankingVoltage.isFinite ? minimumCrankingVoltage : 0.0,
+                status: .replaceImmediate,
+                diagnosticSummary: "Mesure de tension invalide ou capteur déconnecté."
+            )
+        }
+
+        if restingVoltage <= minimumCrankingVoltage {
+            return BatteryHealthReport(
+                stateOfHealthPercent: 0.0,
+                internalResistanceMilliOhms: 999.0,
+                restingVoltage: restingVoltage,
+                minimumCrankingVoltage: minimumCrankingVoltage,
+                status: .replaceImmediate,
+                diagnosticSummary: "Anomalie : tension sous démarreur supérieure ou égale à la tension de repos."
+            )
+        }
+
         let deltaV = max(0.0, restingVoltage - minimumCrankingVoltage)
-        let current = max(50.0, estimatedCrankingAmps)
+        let current = max(50.0, estimatedCrankingAmps.isFinite ? estimatedCrankingAmps : 220.0)
         
         // Résistance interne en milli-Ohms : Ri = (V_rest - V_crank) / I * 1000
         let riMilliOhms = (deltaV / current) * 1000.0

@@ -143,6 +143,14 @@ public indirect enum ASTNode: Sendable, Equatable {
         case round
     }
 
+    private static let maxSafeInt64Double: Double = 9223372036854774784.0
+    private static let minSafeInt64Double: Double = -9223372036854775808.0
+
+    private static func toInt64(_ val: Double) -> Int64? {
+        guard val.isFinite, val >= minSafeInt64Double, val <= maxSafeInt64Double else { return nil }
+        return Int64(val)
+    }
+
     public func evaluate(bytes: [UInt8]) -> Double? {
         switch self {
         case .number(let val):
@@ -160,8 +168,8 @@ public indirect enum ASTNode: Sendable, Equatable {
             case .negate:
                 return -val
             case .bitwiseNot:
-                guard val >= Double(Int64.min), val <= Double(Int64.max) else { return nil }
-                return Double(~Int64(val))
+                guard let intVal = ASTNode.toInt64(val) else { return nil }
+                return Double(~intVal)
             case .logicalNot:
                 return (abs(val) < 1e-9) ? 1.0 : 0.0
             }
@@ -191,25 +199,28 @@ public indirect enum ASTNode: Sendable, Equatable {
                 let res = left.truncatingRemainder(dividingBy: right)
                 return res.isFinite ? res : nil
             case .bitwiseAnd:
-                guard left >= Double(Int64.min), left <= Double(Int64.max),
-                      right >= Double(Int64.min), right <= Double(Int64.max) else { return nil }
-                return Double(Int64(left) & Int64(right))
+                guard let l = ASTNode.toInt64(left), let r = ASTNode.toInt64(right) else { return nil }
+                return Double(l & r)
             case .bitwiseOr:
-                guard left >= Double(Int64.min), left <= Double(Int64.max),
-                      right >= Double(Int64.min), right <= Double(Int64.max) else { return nil }
-                return Double(Int64(left) | Int64(right))
+                guard let l = ASTNode.toInt64(left), let r = ASTNode.toInt64(right) else { return nil }
+                return Double(l | r)
             case .bitwiseXor:
-                guard left >= Double(Int64.min), left <= Double(Int64.max),
-                      right >= Double(Int64.min), right <= Double(Int64.max) else { return nil }
-                return Double(Int64(left) ^ Int64(right))
+                guard let l = ASTNode.toInt64(left), let r = ASTNode.toInt64(right) else { return nil }
+                return Double(l ^ r)
             case .shiftLeft:
-                guard left >= Double(Int64.min), left <= Double(Int64.max) else { return nil }
-                let shift = Int(right) & 63
-                return Double(Int64(left) &<< shift)
+                guard let l = ASTNode.toInt64(left),
+                      right.isFinite,
+                      let rawShift = ASTNode.toInt64(right),
+                      rawShift >= 0 else { return nil }
+                let shift = Int(rawShift & 63)
+                return Double(l &<< shift)
             case .shiftRight:
-                guard left >= Double(Int64.min), left <= Double(Int64.max) else { return nil }
-                let shift = Int(right) & 63
-                return Double(Int64(left) &>> shift)
+                guard let l = ASTNode.toInt64(left),
+                      right.isFinite,
+                      let rawShift = ASTNode.toInt64(right),
+                      rawShift >= 0 else { return nil }
+                let shift = Int(rawShift & 63)
+                return Double(l &>> shift)
             case .equal:
                 return abs(left - right) < 1e-9 ? 1.0 : 0.0
             case .notEqual:
@@ -230,18 +241,16 @@ public indirect enum ASTNode: Sendable, Equatable {
                 if isLeftBool && isRightBool {
                     return (abs(left) > 1e-9 && abs(right) > 1e-9) ? 1.0 : 0.0
                 }
-                guard left >= Double(Int64.min), left <= Double(Int64.max),
-                      right >= Double(Int64.min), right <= Double(Int64.max) else { return nil }
-                return Double(Int64(left) & Int64(right))
+                guard let l = ASTNode.toInt64(left), let r = ASTNode.toInt64(right) else { return nil }
+                return Double(l & r)
             case .logicalOr:
                 let isLeftBool = (abs(left) < 1e-9 || abs(left - 1.0) < 1e-9)
                 let isRightBool = (abs(right) < 1e-9 || abs(right - 1.0) < 1e-9)
                 if isLeftBool && isRightBool {
                     return (abs(left) > 1e-9 || abs(right) > 1e-9) ? 1.0 : 0.0
                 }
-                guard left >= Double(Int64.min), left <= Double(Int64.max),
-                      right >= Double(Int64.min), right <= Double(Int64.max) else { return nil }
-                return Double(Int64(left) | Int64(right))
+                guard let l = ASTNode.toInt64(left), let r = ASTNode.toInt64(right) else { return nil }
+                return Double(l | r)
             }
 
         case .function(let fn, let args):

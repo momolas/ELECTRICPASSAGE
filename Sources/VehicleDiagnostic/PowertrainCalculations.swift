@@ -32,19 +32,21 @@ public enum PowertrainCalculations: Sendable {
     ///   - rpm: Régime moteur en tours par minute (RPM).
     /// - Returns: Tuple contenant la puissance en kW et en chevaux (ch).
     public static func instantaneousPower(torqueNm: Double, rpm: Double) -> (kw: Double, horsepower: Double) {
-        guard rpm > 0, torqueNm > 0 else { return (0.0, 0.0) }
+        guard torqueNm.isFinite, rpm.isFinite, rpm > 0, torqueNm > 0 else { return (0.0, 0.0) }
         let omega = (2.0 * Double.pi * rpm) / 60.0
         let watts = torqueNm * omega
         let kw = watts / 1000.0
         let hp = watts / wattsPerMetricHorsepower
+        guard kw.isFinite, hp.isFinite else { return (0.0, 0.0) }
         return (kw, hp)
     }
 
     /// Calcule le couple moteur instantané (en N.m) à partir de la puissance en kW et du régime.
     public static func instantaneousTorque(powerKw: Double, rpm: Double) -> Double {
-        guard powerKw > 0, rpm > 0 else { return 0.0 }
+        guard powerKw.isFinite, rpm.isFinite, powerKw > 0, rpm > 0 else { return 0.0 }
         let omega = (2.0 * Double.pi * rpm) / 60.0
-        return (powerKw * 1000.0) / omega
+        let torque = (powerKw * 1000.0) / omega
+        return torque.isFinite ? torque : 0.0
     }
 
     // MARK: - Consommation de Carburant
@@ -63,16 +65,18 @@ public enum PowertrainCalculations: Sendable {
         afr: Double = standardGasolineAFR,
         fuelDensityGPerL: Double = standardGasolineDensityGPerL
     ) -> (litersPerHour: Double, litersPer100Km: Double?) {
-        guard mafGPerSec > 0, afr > 0, fuelDensityGPerL > 0 else {
+        guard mafGPerSec.isFinite, speedKmh.isFinite, afr.isFinite, fuelDensityGPerL.isFinite,
+              mafGPerSec > 0, afr > 0, fuelDensityGPerL > 0 else {
             return (0.0, nil)
         }
 
         let fuelGramsPerSec = mafGPerSec / afr
         let litersPerHour = (fuelGramsPerSec * 3600.0) / fuelDensityGPerL
+        guard litersPerHour.isFinite else { return (0.0, nil) }
 
         if speedKmh >= 3.0 {
             let litersPer100Km = (litersPerHour / speedKmh) * 100.0
-            return (litersPerHour, litersPer100Km)
+            return (litersPerHour, litersPer100Km.isFinite ? litersPer100Km : nil)
         } else {
             return (litersPerHour, nil)
         }
@@ -99,16 +103,18 @@ public enum PowertrainCalculations: Sendable {
         iatCelsius: Double,
         displacementLiters: Double
     ) -> Double? {
-        guard mafGPerSec > 0, rpm > 0, mapKpa > 0, displacementLiters > 0 else { return nil }
+        guard mafGPerSec.isFinite, rpm.isFinite, mapKpa.isFinite, iatCelsius.isFinite, displacementLiters.isFinite,
+              mafGPerSec > 0, rpm > 0, mapKpa > 0, displacementLiters > 0 else { return nil }
 
         let tempKelvin = iatCelsius + 273.15
-        guard tempKelvin > 0 else { return nil }
+        guard tempKelvin.isFinite, tempKelvin > 0 else { return nil }
 
         // Pression en Pascals : 1 kPa = 1000 Pa
         let pressurePa = mapKpa * 1000.0
 
         // Masse volumique de l'air dans l'admission : rho = P / (R * T) [kg/m^3]
         let airDensityKgPerM3 = pressurePa / (dryAirGasConstant * tempKelvin)
+        guard airDensityKgPerM3.isFinite else { return nil }
 
         // Volume aspiré par seconde pour un moteur à 4 temps : (Cylindrée m^3 * (RPM / 120))
         let displacementM3 = displacementLiters * 1e-3
@@ -117,8 +123,9 @@ public enum PowertrainCalculations: Sendable {
         // Débit massique théorique en g/s (kg * 1000)
         let theoreticalMafGPerSec = (aspiratedVolumeM3PerSec * airDensityKgPerM3) * 1000.0
 
-        guard theoreticalMafGPerSec > 1e-6 else { return nil }
+        guard theoreticalMafGPerSec.isFinite, theoreticalMafGPerSec > 1e-6 else { return nil }
         let ve = (mafGPerSec / theoreticalMafGPerSec) * 100.0
+        guard ve.isFinite else { return nil }
         return max(0.0, ve)
     }
 
@@ -126,8 +133,9 @@ public enum PowertrainCalculations: Sendable {
 
     /// Calcule la charge moteur estimée (%) par rapport au couple de référence usine.
     public static func estimatedEngineLoad(actualTorqueNm: Double, referenceTorqueNm: Double) -> Double? {
-        guard referenceTorqueNm > 0 else { return nil }
+        guard actualTorqueNm.isFinite, referenceTorqueNm.isFinite, referenceTorqueNm > 0 else { return nil }
         let load = (actualTorqueNm / referenceTorqueNm) * 100.0
+        guard load.isFinite else { return nil }
         return max(0.0, min(100.0, load))
     }
 }

@@ -1051,6 +1051,221 @@ struct VehicleKitTests {
         #expect(badReport.status == .replaceImmediate)
         #expect(badReport.stateOfHealthPercent < 50.0)
     }
+
+    // MARK: - Non-Regression & Hardening Tests
+
+    @Test("Spectral Analyzer Top Peaks & Bounds Safety")
+    func testSpectralAnalyzerBounds() {
+        let dummySamples = (0..<16).map { sin(Double($0) * 0.5) }
+
+        // 1. Negative topPeaksCount must return nil safely (no Array.prefix crash)
+        let negativeResult = SpectralAnalyzer.analyze(samples: dummySamples, sampleRateHz: 100, topPeaksCount: -1)
+        #expect(negativeResult == nil)
+
+        // 2. Zero topPeaksCount must return nil
+        let zeroResult = SpectralAnalyzer.analyze(samples: dummySamples, sampleRateHz: 100, topPeaksCount: 0)
+        #expect(zeroResult == nil)
+
+        // 3. Insufficient samples (< 8) must return nil
+        let shortResult = SpectralAnalyzer.analyze(samples: [1.0, 2.0, 3.0], sampleRateHz: 100, topPeaksCount: 2)
+        #expect(shortResult == nil)
+
+        // 4. Invalid sample rate must return nil
+        let badRateResult = SpectralAnalyzer.analyze(samples: dummySamples, sampleRateHz: -50.0, topPeaksCount: 2)
+        #expect(badRateResult == nil)
+
+        // 5. Valid signal produces valid dominant peaks
+        let validResult = SpectralAnalyzer.analyze(samples: dummySamples, sampleRateHz: 100, topPeaksCount: 2)
+        #expect(validResult != nil)
+        #expect(validResult?.dominantPeaks.count ?? 0 <= 2)
+    }
+
+    @Test("Formula Evaluator Bit Shift & IEEE-754 Safety")
+    func testFormulaEvaluatorBitShiftSafety() {
+        let evaluator = FormulaEvaluator()
+
+        // 1. Bit shift with Infinity RHS should fail gracefully
+        let infShift = evaluator.evaluate(formula: "1 << (1 / 0)", bytes: [0x00])
+        #expect(infShift == nil)
+
+        // 2. Bit shift with masking semantics (64 & 63 = 0 -> 1 << 0 = 1.0)
+        let maskingShift = evaluator.evaluate(formula: "1 << 64", bytes: [0x00])
+        #expect(maskingShift == 1.0)
+
+        // 3. Bit shift < 0 should fail gracefully
+        let negShift = evaluator.evaluate(formula: "1 << -1", bytes: [0x00])
+        #expect(negShift == nil)
+
+        // 4. Bit shift with massive double (1e25) should fail gracefully
+        let hugeShift = evaluator.evaluate(formula: "1 << 10000000000000000000000000", bytes: [0x00])
+        #expect(hugeShift == nil)
+
+        // 5. Normal bit shifts must succeed
+        #expect(evaluator.evaluate(formula: "1 << 4", bytes: [0x00]) == 16.0)
+        #expect(evaluator.evaluate(formula: "32 >> 2", bytes: [0x00]) == 8.0)
+
+        // 6. Safe bitwise operations with valid Int64 boundaries
+        let bitwiseAndRes = evaluator.evaluate(formula: "A & 15", bytes: [0xFA])
+        #expect(bitwiseAndRes == 10.0)
+    }
+
+    @Test("Odometer Fraud Auditor Infinite/Corrupt Hours")
+    func testOdometerFraudAuditorCorruptedHours() {
+        // Infinity engine hours should not trigger a fatal error or false crash
+        let infInput = OdometerFraudAuditor.InputData(
+            clusterMileageKm: 100000,
+            engineECUMileageKm: 100000,
+            absMileageKm: 100000,
+            transmissionMileageKm: 100000,
+            engineHours: Double.infinity,
+            dpfLastRegenerationKm: 99000,
+            freezeFrameMileages: [95000]
+        )
+        let report = OdometerFraudAuditor.audit(input: infInput)
+        #expect(report.riskScore.isFinite)
+
+        // NaN engine hours
+        let nanInput = OdometerFraudAuditor.InputData(
+            clusterMileageKm: 100000,
+            engineECUMileageKm: 100000,
+            absMileageKm: 100000,
+            transmissionMileageKm: 100000,
+            engineHours: Double.nan,
+            dpfLastRegenerationKm: 99000,
+            freezeFrameMileages: [95000]
+        )
+        let nanReport = OdometerFraudAuditor.audit(input: nanInput)
+        #expect(nanReport.riskScore.isFinite)
+    }
+
+    @Test("Battery Health Estimator Corrupted/Inverted Voltages")
+    func testBatteryHealthEstimatorCorruptInputs() {
+        // 1. NaN resting voltage
+        let nanReport = BatteryHealthEstimator.estimate(restingVoltage: Double.nan, minimumCrankingVoltage: 10.0)
+        #expect(nanReport.status == .replaceImmediate)
+
+        // 2. Inverted crank voltage (cranking > resting is physically impossible)
+        let invertedReport = BatteryHealthEstimator.estimate(restingVoltage: 10.0, minimumCrankingVoltage: 12.0)
+        #expect(invertedReport.status == .replaceImmediate)
+
+        // 3. Negative resting voltage
+        let negReport = BatteryHealthEstimator.estimate(restingVoltage: -12.0, minimumCrankingVoltage: 8.0)
+        #expect(negReport.status == .replaceImmediate)
+    }
+
+    @Test("Signal Filter Super-Nyquist & Numerical Stability")
+    func testSignalFilterNyquistStability() {
+        // 1. Super-Nyquist cutoff (cutoffFrequency >= sampleRate / 2) must be clamped safely
+        let biquad = SignalFilter.Biquad.lowPass(cutoffFrequency: 100.0, sampleRate: 50.0)
+        #expect(biquad.b0.isFinite)
+        #expect(biquad.a1.isFinite)
+        #expect(biquad.a2.isFinite)
+
+        let filtered = biquad.filter(batch: [1.0, 2.0, 3.0, 4.0, 5.0])
+        #expect(filtered.allSatisfy { $0.isFinite })
+
+        // 2. Invalid sampleRate or cutoff
+        let safeBiquad = SignalFilter.Biquad.lowPass(cutoffFrequency: 10.0, sampleRate: 0.0)
+        #expect(safeBiquad.b0 == 1.0) // passthrough
+
+        // 3. EMA with NaN alpha
+        let emaNaNAlpha = SignalFilter.exponentialMovingAverage(values: [1.0, 2.0, 3.0], alpha: Double.nan)
+        #expect(emaNaNAlpha.isEmpty)
+
+        // 4. EMA with transient NaN sample dropouts
+        let emaSamples = SignalFilter.exponentialMovingAverage(values: [10.0, Double.nan, 12.0, 14.0], alpha: 0.5)
+        #expect(emaSamples.allSatisfy { $0.isFinite })
+
+        // 5. Median filter with NaN dropouts and even window size
+        let medianFiltered = SignalFilter.medianFilter(values: [1.0, Double.nan, 100.0, 2.0, 3.0], windowSize: 4)
+        #expect(medianFiltered.allSatisfy { $0.isFinite })
+    }
+
+    @Test("BusCoordinator Task-Local Session Token Isolation")
+    @MainActor
+    func testBusCoordinatorSessionTokenIsolation() async throws {
+        let coordinator = BusCoordinator()
+
+        // Nested reentrancy on the same task succeeds via TaskLocal token
+        try await coordinator.withExclusiveAccess(priority: .criticalExclusive, name: "TaskA") {
+            #expect(coordinator.isBusy == true)
+            try await coordinator.withExclusiveAccess(priority: .criticalExclusive, name: "TaskA") {
+                #expect(coordinator.isBusy == true)
+            }
+        }
+        #expect(coordinator.isBusy == false)
+    }
+
+    @Test("Powertrain Calculations Finitude & Defensive Guards")
+    func testPowertrainCalculationsSafety() {
+        // 1. Instantaneous power with Infinity
+        let infPower = PowertrainCalculations.instantaneousPower(torqueNm: Double.infinity, rpm: 2000)
+        #expect(infPower.kw == 0.0)
+        #expect(infPower.horsepower == 0.0)
+
+        // 2. Instantaneous torque with NaN
+        let nanTorque = PowertrainCalculations.instantaneousTorque(powerKw: Double.nan, rpm: 2000)
+        #expect(nanTorque == 0.0)
+
+        // 3. Fuel consumption with NaN
+        let nanFuel = PowertrainCalculations.instantaneousFuelConsumption(mafGPerSec: Double.nan, speedKmh: 50)
+        #expect(nanFuel.litersPerHour == 0.0)
+        #expect(nanFuel.litersPer100Km == nil)
+
+        // 4. Volumetric efficiency with NaN
+        let nanVE = PowertrainCalculations.volumetricEfficiency(
+            mafGPerSec: Double.nan,
+            rpm: 3000,
+            mapKpa: 100,
+            iatCelsius: 20,
+            displacementLiters: 1.6
+        )
+        #expect(nanVE == nil)
+
+        // 5. Normal calculation produces accurate VE
+        let normalVE = PowertrainCalculations.volumetricEfficiency(
+            mafGPerSec: 50.0,
+            rpm: 3000,
+            mapKpa: 100,
+            iatCelsius: 20,
+            displacementLiters: 2.0
+        )
+        #expect(normalVE != nil)
+        #expect((normalVE ?? 0) > 0)
+    }
+
+    @Test("DDT2000 Raw Structs Public Initializers")
+    func testDDT2000RawStructsPublicInits() {
+        let obd = DDT2UnifiedConverter.DDT2000RawOBD(protocolName: "CAN", send_id: "7E0", recv_id: "7E8", baudrate: 500000)
+        #expect(obd.protocolName == "CAN")
+        #expect(obd.send_id == "7E0")
+
+        let data = DDT2UnifiedConverter.DDT2000RawData(bitscount: 8, bytescount: 1, scaled: true, step: 0.5, offset: 0.0)
+        #expect(data.bitscount == 8)
+        #expect(data.step == 0.5)
+
+        let item = DDT2UnifiedConverter.DDT2000RawReceiveItem(firstbyte: 1, bitoffset: 0, ref: true)
+        #expect(item.firstbyte == 1)
+
+        let req = DDT2UnifiedConverter.DDT2000RawRequest(sentbytes: "2101", name: "ReadData", receivebyte_dataitems: ["Param": item])
+        #expect(req.sentbytes == "2101")
+        #expect(req.receivebyte_dataitems?["Param"]?.firstbyte == 1)
+    }
+
+    @Test("CAN Intrusion Detector Frame Buffer & Tracking Pruning")
+    func testCANIntrusionDetectorPruning() async {
+        let detector = CANIntrusionDetector(windowSize: 10)
+
+        // Ingest 20 frames with varying CAN IDs to trigger eviction
+        for i in 0..<20 {
+            let frame = CANSampleFrame(canID: UInt32(0x100 + i), payload: [0x01], timestampSeconds: Double(i) * 0.01)
+            _ = await detector.ingest(frame: frame)
+        }
+
+        let report = await detector.evaluateSecurity()
+        #expect(report.messageCount == 10)
+    }
 }
+
 
 

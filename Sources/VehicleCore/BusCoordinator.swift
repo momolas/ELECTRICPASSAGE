@@ -19,14 +19,19 @@ public enum BusPriority: Int, Comparable, Sendable {
 public final class BusCoordinator: Sendable {
     public static let shared = BusCoordinator()
 
+    @TaskLocal public static var currentSessionToken: UUID? = nil
+
     public private(set) var activeSessionName: String? = nil
     public private(set) var activePriority: BusPriority = .background
     public private(set) var isBusy: Bool = false
+    private var activeSessionToken: UUID? = nil
 
     private struct Waiter {
+        let id: UUID
         let priority: BusPriority
         let sequence: UInt64
         let name: String
+        let token: UUID
         let continuation: CheckedContinuation<Void, Never>
     }
 
@@ -40,33 +45,52 @@ public final class BusCoordinator: Sendable {
     /// Garantit l'exclusion mutuelle stricte : aucune tâche concurrente ne peut s'exécuter sur le bus.
     /// Les tâches en attente sont réveillées par ordre décroissant de priorité (criticalExclusive > interactive > background)
     /// et selon un ordonnancement FIFO strict au sein d'un même échelon de priorité.
-    public func acquire(priority: BusPriority = .interactive, name: String) async {
+    public func acquire(priority: BusPriority = .interactive, name: String, sessionToken: UUID? = nil) async {
+        let token = sessionToken ?? BusCoordinator.currentSessionToken ?? UUID()
+
         if isBusy {
-            if activeSessionName == name {
-                // Réentrance autorisée pour la même session
+            // Réentrance autorisée UNIQUEMENT si le même token de session dynamique est présent
+            if let activeToken = activeSessionToken, activeToken == token {
                 activeDepth += 1
                 return
             }
 
-            await withCheckedContinuation { continuation in
-                sequenceCounter += 1
-                let waiter = Waiter(priority: priority, sequence: sequenceCounter, name: name, continuation: continuation)
-                waiters.append(waiter)
-                waiters.sort {
-                    if $0.priority != $1.priority {
-                        return $0.priority > $1.priority
+            let waiterId = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    sequenceCounter += 1
+                    let waiter = Waiter(
+                        id: waiterId,
+                        priority: priority,
+                        sequence: sequenceCounter,
+                        name: name,
+                        token: token,
+                        continuation: continuation
+                    )
+                    waiters.append(waiter)
+                    waiters.sort {
+                        if $0.priority != $1.priority {
+                            return $0.priority > $1.priority
+                        }
+                        return $0.sequence < $1.sequence
                     }
-                    return $0.sequence < $1.sequence
+                }
+            } onCancel: {
+                Task { @MainActor in
+                    self.removeWaiter(id: waiterId)
                 }
             }
-            // En réveil par passage direct (direct lock handoff), isBusy reste true
-            // et les métadonnées de session ont été assignées immédiatement lors du release().
         } else {
             isBusy = true
             activePriority = priority
             activeSessionName = name
+            activeSessionToken = token
             activeDepth = 0
         }
+    }
+
+    private func removeWaiter(id: UUID) {
+        waiters.removeAll(where: { $0.id == id })
     }
 
     /// Libère l'accès au bus et transmet directement le verrou à la tâche la plus prioritaire en attente (Direct Lock Handoff).
@@ -84,11 +108,13 @@ public final class BusCoordinator: Sendable {
             // Direct lock handoff : isBusy reste true, passage de propriété immédiat
             activePriority = next.priority
             activeSessionName = next.name
+            activeSessionToken = next.token
             activeDepth = 0
             next.continuation.resume()
         } else {
             isBusy = false
             activeSessionName = nil
+            activeSessionToken = nil
             activePriority = .background
             activeDepth = 0
         }
@@ -101,11 +127,21 @@ public final class BusCoordinator: Sendable {
         operation: @MainActor () async throws -> T
     ) async throws -> T {
         try Task.checkCancellation()
-        await acquire(priority: priority, name: name)
+        let token = BusCoordinator.currentSessionToken ?? UUID()
+
+        if isBusy, let activeToken = activeSessionToken, activeToken == token {
+            activeDepth += 1
+            defer { activeDepth -= 1 }
+            return try await operation()
+        }
+
+        await acquire(priority: priority, name: name, sessionToken: token)
         defer {
             release()
         }
         try Task.checkCancellation()
-        return try await operation()
+        return try await BusCoordinator.$currentSessionToken.withValue(token) {
+            try await operation()
+        }
     }
 }

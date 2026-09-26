@@ -25,6 +25,14 @@ public enum DDT2UnifiedConverter {
         public let baudrate: Int?
         public let funcaddr: String?
 
+        public init(protocolName: String? = nil, send_id: String? = nil, recv_id: String? = nil, baudrate: Int? = nil, funcaddr: String? = nil) {
+            self.protocolName = protocolName
+            self.send_id = send_id
+            self.recv_id = recv_id
+            self.baudrate = baudrate
+            self.funcaddr = funcaddr
+        }
+
         enum CodingKeys: String, CodingKey {
             case protocolName = "protocol"
             case send_id, recv_id, baudrate, funcaddr
@@ -41,18 +49,52 @@ public enum DDT2UnifiedConverter {
         public let format: String?
         public let unit: String?
         public let comment: String?
+
+        public init(
+            bitscount: Int? = nil,
+            bytescount: Int? = nil,
+            scaled: Bool? = nil,
+            signed: Bool? = nil,
+            step: Double? = nil,
+            offset: Double? = nil,
+            format: String? = nil,
+            unit: String? = nil,
+            comment: String? = nil
+        ) {
+            self.bitscount = bitscount
+            self.bytescount = bytescount
+            self.scaled = scaled
+            self.signed = signed
+            self.step = step
+            self.offset = offset
+            self.format = format
+            self.unit = unit
+            self.comment = comment
+        }
     }
 
     public struct DDT2000RawRequest: Decodable, Sendable {
         public let sentbytes: String
         public let name: String
         public let receivebyte_dataitems: [String: DDT2000RawReceiveItem]?
+
+        public init(sentbytes: String, name: String, receivebyte_dataitems: [String: DDT2000RawReceiveItem]? = nil) {
+            self.sentbytes = sentbytes
+            self.name = name
+            self.receivebyte_dataitems = receivebyte_dataitems
+        }
     }
 
     public struct DDT2000RawReceiveItem: Decodable, Sendable {
         public let firstbyte: Int
         public let bitoffset: Int?
         public let ref: Bool?
+
+        public init(firstbyte: Int, bitoffset: Int? = nil, ref: Bool? = nil) {
+            self.firstbyte = firstbyte
+            self.bitoffset = bitoffset
+            self.ref = ref
+        }
     }
 
     /// Convertit des données JSON DDT2000 brutes en `UnifiedECUProfile`

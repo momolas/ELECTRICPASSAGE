@@ -13,7 +13,7 @@ public actor ISOTPReassembler {
         var totalLength: Int
         var buffer: Data
         var nextSequence: UInt8
-        var createdAt: ContinuousClock.Instant = .now
+        var lastActivity: ContinuousClock.Instant = .now
     }
 
     private var states: [UInt32: ReassemblyState] = [:]
@@ -31,7 +31,7 @@ public actor ISOTPReassembler {
     private func purgeStaleStates() {
         let now = ContinuousClock.Instant.now
         states = states.filter { _, state in
-            now.duration(to: state.createdAt) > .seconds(-1.5)
+            now.duration(to: state.lastActivity) > .seconds(-1.5)
         }
     }
 
@@ -90,6 +90,7 @@ public actor ISOTPReassembler {
             let payload = frame[1...]
             state.buffer.append(payload)
             state.nextSequence = (state.nextSequence + 1) & 0x0F
+            state.lastActivity = .now
 
             if state.buffer.count >= state.totalLength {
                 states.removeValue(forKey: address)

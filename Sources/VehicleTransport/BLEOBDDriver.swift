@@ -1,4 +1,6 @@
+#if canImport(CoreBluetooth)
 import CoreBluetooth
+#endif
 import Foundation
 import VehicleCore
 
@@ -58,6 +60,7 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
 
     deinit {
         timeoutTask?.cancel()
+        responseContinuation?.resume(throwing: CancellationError())
     }
 
     // MARK: - VehicleInterface Lifecycle
@@ -181,6 +184,7 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
         guard self.currentRequestId == requestId, let continuation = self.responseContinuation else { return }
         self.responseContinuation = nil
         self.timeoutTask = nil
+        self.responseBuffer = ""
         continuation.resume(throwing: NSError(domain: "BLEOBDDriver", code: -3, userInfo: [NSLocalizedDescriptionKey: "Timeout BLE"]))
     }
 
@@ -189,6 +193,7 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
         self.responseContinuation = nil
         self.timeoutTask?.cancel()
         self.timeoutTask = nil
+        self.responseBuffer = ""
         continuation.resume(throwing: CancellationError())
     }
 

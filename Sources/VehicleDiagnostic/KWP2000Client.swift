@@ -81,7 +81,8 @@ public enum KWP2000Error: Error, LocalizedError, Sendable {
 public actor KWP2000Client {
     private let interface: VehicleInterface
     private var testerPresentTask: Task<Void, Never>?
-    private var isAtomicTransactionActive: Bool = false
+    private var atomicTransactionDepth: Int = 0
+    private var isAtomicTransactionActive: Bool { atomicTransactionDepth > 0 }
 
     deinit {
         testerPresentTask?.cancel()
@@ -160,8 +161,8 @@ public actor KWP2000Client {
 
     /// Effectue la routine SecurityAccess (Service 27) de manière atomique sans interférence TesterPresent.
     public func performSecurityAccess(level: UInt8, keyCalculator: @Sendable (String) -> String) async throws {
-        isAtomicTransactionActive = true
-        defer { isAtomicTransactionActive = false }
+        atomicTransactionDepth += 1
+        defer { atomicTransactionDepth -= 1 }
 
         let requestSeedCmd = String(format: "27%02X", level)
         let seedResponse = try await interface.sendDiagnosticRequest(requestSeedCmd, timeout: 2.0)
@@ -201,8 +202,8 @@ public actor KWP2000Client {
     /// Exécute une opération atomique sur le bus KWP2000 (ex: upload/download mémoire)
     /// en suspendant l'envoi de trames TesterPresent susceptibles de polluer la séquence.
     public func withAtomicTransaction<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
-        isAtomicTransactionActive = true
-        defer { isAtomicTransactionActive = false }
+        atomicTransactionDepth += 1
+        defer { atomicTransactionDepth -= 1 }
         return try await operation()
     }
 

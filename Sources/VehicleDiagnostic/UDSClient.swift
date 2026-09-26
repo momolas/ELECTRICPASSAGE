@@ -7,7 +7,8 @@ public actor UDSClient {
 
     private let interface: VehicleInterface
     private var testerPresentTask: Task<Void, Never>?
-    private var isAtomicTransactionActive: Bool = false
+    private var atomicTransactionDepth: Int = 0
+    private var isAtomicTransactionActive: Bool { atomicTransactionDepth > 0 }
 
     public enum UDSError: LocalizedError, Sendable {
         case negativeResponse(service: UInt8, nrc: UInt8, message: String)
@@ -135,8 +136,8 @@ public actor UDSClient {
     // MARK: - Transactions Atomiques & Isolation de Keepalive
 
     public func withAtomicTransaction<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
-        isAtomicTransactionActive = true
-        defer { isAtomicTransactionActive = false }
+        atomicTransactionDepth += 1
+        defer { atomicTransactionDepth -= 1 }
         return try await operation()
     }
 
@@ -146,8 +147,8 @@ public actor UDSClient {
         level: UInt8,
         keyCalculation: @Sendable (String) async throws -> String
     ) async throws {
-        isAtomicTransactionActive = true
-        defer { isAtomicTransactionActive = false }
+        atomicTransactionDepth += 1
+        defer { atomicTransactionDepth -= 1 }
 
         // 1. Request Seed (27 + Odd Subfunction)
         let requestLevel = level % 2 == 0 ? level - 1 : level

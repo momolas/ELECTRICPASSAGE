@@ -80,13 +80,16 @@ public enum SemanticSignalClassifier: Sendable {
 
         // 1. Marqueur Constant
         if range == 0.0 {
+            let hexStr = (minVal.isFinite && minVal >= 0 && minVal <= Double(UInt64.max))
+                ? String(UInt64(minVal), radix: 16, uppercase: true)
+                : String(format: "%.1f", minVal)
             return SemanticClassificationResult(
                 sliceName: sliceName,
                 category: .constantMarker,
                 confidence: 0.99,
                 suggestedUnit: "const",
                 dynamicRange: 0.0,
-                rationale: "Valeur invariante (0x\(String(Int(minVal), radix: 16, uppercase: true)))"
+                rationale: "Valeur invariante (0x\(hexStr))"
             )
         }
 

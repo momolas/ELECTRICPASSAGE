@@ -75,6 +75,7 @@ public struct DoIPMessage: Sendable, Equatable {
                       UInt32(data[data.startIndex + 7])
         
         let payloadStart = data.startIndex + 8
+        guard Int.max - payloadStart >= Int(length) else { return nil }
         let payloadEnd = payloadStart + Int(length)
         guard data.endIndex >= payloadEnd else { return nil }
         
