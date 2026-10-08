@@ -56,6 +56,9 @@ public actor CANIntrusionDetector {
     private let windowSize: Int
     private var idLastTimestamp: [UInt32: Double] = [:]
     private var idIntervals: [UInt32: [Double]] = [:]
+    private var idCounts: [UInt32: Int] = [:]
+    private var byteCounts: [UInt8: Int] = [:]
+    private var totalByteCount: Int = 0
 
     public init(windowSize: Int = 100) {
         self.windowSize = windowSize
@@ -66,6 +69,9 @@ public actor CANIntrusionDetector {
         frameBuffer.removeAll()
         idLastTimestamp.removeAll()
         idIntervals.removeAll()
+        idCounts.removeAll()
+        byteCounts.removeAll()
+        totalByteCount = 0
     }
 
     /// Enregistre une trame CAN et évalue la sécurité du bus
@@ -75,12 +81,31 @@ public actor CANIntrusionDetector {
         }
 
         frameBuffer.append(frame)
+        idCounts[frame.canID, default: 0] += 1
+        for b in frame.payload {
+            byteCounts[b, default: 0] += 1
+            totalByteCount += 1
+        }
+
         if frameBuffer.count > windowSize {
             let evicted = frameBuffer.removeFirst()
-            // Si l'identifiant n'est plus présent dans la fenêtre glissante, purger son état
-            if !frameBuffer.contains(where: { $0.canID == evicted.canID }) {
+            let remainingCount = idCounts[evicted.canID, default: 1] - 1
+            if remainingCount <= 0 {
+                idCounts.removeValue(forKey: evicted.canID)
                 idLastTimestamp.removeValue(forKey: evicted.canID)
                 idIntervals.removeValue(forKey: evicted.canID)
+            } else {
+                idCounts[evicted.canID] = remainingCount
+            }
+
+            for b in evicted.payload {
+                let c = byteCounts[b, default: 1] - 1
+                if c <= 0 {
+                    byteCounts.removeValue(forKey: b)
+                } else {
+                    byteCounts[b] = c
+                }
+                totalByteCount -= 1
             }
         }
 
@@ -113,20 +138,12 @@ public actor CANIntrusionDetector {
             )
         }
 
-        // 1. Calcul de l'entropie de Shannon globale des octets
-        var byteFrequencies = [UInt8: Int]()
-        var totalBytes = 0
-        for f in frameBuffer {
-            for b in f.payload {
-                byteFrequencies[b, default: 0] += 1
-                totalBytes += 1
-            }
-        }
-
+        // 1. Calcul de l'entropie de Shannon globale en O(1) via la table glissante des octets
         var entropy = 0.0
-        if totalBytes > 0 {
-            for (_, count) in byteFrequencies {
-                let p = Double(count) / Double(totalBytes)
+        if totalByteCount > 0 {
+            let total = Double(totalByteCount)
+            for (_, count) in byteCounts {
+                let p = Double(count) / total
                 entropy -= p * log2(p)
             }
         }

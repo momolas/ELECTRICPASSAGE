@@ -450,7 +450,7 @@ public actor Sampler {
     }
 
     private func extractPayload(response: String, mode: String, pid: String) -> [UInt8]? {
-        guard let modeByte = UInt8(mode, radix: 16) else { return nil }
+        guard let modeByte = UInt8(mode, radix: 16), modeByte <= 0xBF else { return nil }
         let prefix = String(format: "%02X%@", modeByte + 0x40, pid.uppercased())
         let clean = response.uppercased().replacingOccurrences(of: " ", with: "")
         if let prefixRange = clean.range(of: prefix) {

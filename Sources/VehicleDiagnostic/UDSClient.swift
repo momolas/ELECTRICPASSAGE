@@ -254,6 +254,9 @@ public actor UDSClient {
             throw UDSError.negativeResponse(service: service, nrc: nrc, message: msg)
         }
 
+        guard expectedSID <= 0xBF else {
+            throw UDSError.invalidResponseFormat("SID invalide pour réponse positive (0x\(String(format: "%02X", expectedSID)))")
+        }
         let expectedPositiveSID = String(format: "%02X", expectedSID + 0x40)
         guard clean.hasPrefix(expectedPositiveSID) else {
             throw UDSError.invalidResponseFormat("Réponse inattendue (attendu: \(expectedPositiveSID)..., reçu: \(clean))")

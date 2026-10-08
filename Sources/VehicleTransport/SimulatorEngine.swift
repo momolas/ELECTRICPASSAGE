@@ -215,11 +215,33 @@ public actor SimulatorEngine: VehicleInterface {
             return handleMode01Request(clean)
         }
 
+        // 13. OBD-II Mode 06 (On-Board Monitoring Test Results)
+        if clean.hasPrefix("06") {
+            return handleMode06Request(clean)
+        }
+
         // Service Not Supported (NRC 0x11)
         if clean.count >= 2 {
             return "7F" + String(clean.prefix(2)) + "11"
         }
         return "7F0011"
+    }
+
+    private func handleMode06Request(_ clean: String) -> String {
+        if clean == "0600" {
+            // Supported MIDs 01-20
+            return "46 00 80 00 00 01"
+        }
+        if clean.hasPrefix("0621") {
+            // Catalyst Bank 1: MID 21, TID 01, CID 01, Val 30, Min 0, Max 100
+            return "46 21 01 01 00 1E 00 00 00 64"
+        }
+        if clean.hasPrefix("06A2") {
+            // Misfire Cyl 1: MID A2, TID 0B, CID 01, Val 0, Min 0, Max 20
+            return "46 A2 0B 01 00 00 00 00 00 14"
+        }
+        // Réponse par défaut combinée (Catalyseur + Ratés d'allumage)
+        return "46 21 01 01 00 1E 00 00 00 64 A2 0B 01 00 00 00 00 00 14"
     }
 
     // MARK: - Traitement Détaillé Mode 01 & Multi-PIDs

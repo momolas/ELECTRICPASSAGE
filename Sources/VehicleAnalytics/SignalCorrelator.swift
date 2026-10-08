@@ -54,15 +54,17 @@ public enum SignalCorrelator: Sendable {
         guard x.count == y.count, x.count >= 2 else { return nil }
 
         #if canImport(Accelerate)
+        let n = Double(x.count)
         let meanX = vDSP.mean(x)
         let meanY = vDSP.mean(y)
 
-        let dx = vDSP.add(-meanX, x)
-        let dy = vDSP.add(-meanY, y)
+        let sumXY = vDSP.dot(x, y)
+        let sumXX = vDSP.dot(x, x)
+        let sumYY = vDSP.dot(y, y)
 
-        let num = vDSP.dot(dx, dy)
-        let denX = vDSP.dot(dx, dx)
-        let denY = vDSP.dot(dy, dy)
+        let num = sumXY - n * meanX * meanY
+        let denX = max(0.0, sumXX - n * meanX * meanX)
+        let denY = max(0.0, sumYY - n * meanY * meanY)
 
         guard denX > 1e-12, denY > 1e-12 else { return nil }
         let den = sqrt(denX) * sqrt(denY)

@@ -1265,6 +1265,98 @@ struct VehicleKitTests {
         let report = await detector.evaluateSecurity()
         #expect(report.messageCount == 10)
     }
+
+    @Test("ISO-TP CAN-FD Single Frame & 32-bit First Frame")
+    func testISOTPCANFDExtension() async {
+        let reassembler = ISOTPReassembler()
+
+        // 1. CAN-FD Single Frame with 16 bytes payload (byte 0 = 0x00, byte 1 = 0x10)
+        let fdPayload = [UInt8](repeating: 0xAB, count: 16)
+        var fdFrameData = Data([0x00, 0x10])
+        fdFrameData.append(contentsOf: fdPayload)
+        let sfResult = await reassembler.processFrame(address: 0x7E8, data: fdFrameData)
+        if case .completed(let payload) = sfResult {
+            #expect(payload.count == 16)
+            #expect(payload.first == 0xAB)
+        } else {
+            Issue.record("Expected CAN-FD Single Frame completion")
+        }
+
+        // 2. CAN-FD First Frame with 32-bit length (5000 bytes > 4095)
+        let ffHeader = Data([0x10, 0x00, 0x00, 0x00, 0x13, 0x88, 0x42, 0x43])
+        let ffResult = await reassembler.processFrame(address: 0x7E8, data: ffHeader)
+        #expect(ffResult == .needsFlowControl)
+    }
+
+    @Test("OBD2 Mode 06 On-Board Monitoring Decoder")
+    func testOBD2Mode06Decoding() {
+        // Response with 2 tests:
+        // Test 1: MID 21 (Catalyst Bank 1), TID 01, CID 01, Val 30 (0x001E), Min 0 (0x0000), Max 100 (0x0064) -> Passed
+        // Test 2: MID A2 (Misfire Cyl 1), TID 0B, CID 01, Val 25 (0x0019), Min 0 (0x0000), Max 20 (0x0014) -> Failed (val > max)
+        let hex = "46 21 01 01 00 1E 00 00 00 64 A2 0B 01 00 19 00 00 00 14"
+        let results = OBD2Analyzer.decodeMode06(responseHex: hex)
+        #expect(results.count == 2)
+
+        #expect(results[0].mid == 0x21)
+        #expect(results[0].monitorName == "Catalyst Monitor Bank 1")
+        #expect(results[0].testValue == 30.0)
+        #expect(results[0].minLimit == 0.0)
+        #expect(results[0].maxLimit == 100.0)
+        #expect(results[0].isPassed == true)
+
+        #expect(results[1].mid == 0xA2)
+        #expect(results[1].monitorName == "Misfire Cylinder 1 Monitor")
+        #expect(results[1].testValue == 25.0)
+        #expect(results[1].isPassed == false)
+    }
+
+    @Test("Simulator Engine Mode 06 Diagnostics")
+    func testSimulatorEngineMode06() async throws {
+        let sim = SimulatorEngine()
+        let resp21 = try await sim.sendDiagnosticRequest("0621")
+        #expect(resp21.contains("46 21"))
+
+        let results = OBD2Analyzer.decodeMode06(responseHex: resp21)
+        #expect(!results.isEmpty)
+        #expect(results.first?.isPassed == true)
+    }
+
+    @Test("Powertrain Thermodynamics, BSFC, CO2 & Turbo Boost")
+    func testPowertrainThermodynamicsAndEmissions() {
+        // 1. BSFC calculation (Power 100 kW, MAF 50 g/s, AFR 14.7)
+        let bsfc = PowertrainCalculations.brakeSpecificFuelConsumption(powerKw: 100.0, mafGPerSec: 50.0)
+        #expect(bsfc != nil)
+        #expect((bsfc ?? 0) > 100.0 && (bsfc ?? 0) < 150.0)
+
+        // 2. Thermal efficiency (BSFC ~ 122.45, LHV 44 MJ/kg)
+        let eta = PowertrainCalculations.thermalEfficiency(powerKw: 100.0, mafGPerSec: 50.0)
+        #expect(eta != nil)
+        #expect((eta ?? 0) > 0 && (eta ?? 0) <= 100.0)
+
+        // 3. CO2 emissions (MAF 50 g/s, speed 100 km/h)
+        let co2 = PowertrainCalculations.instantaneousCO2Emissions(mafGPerSec: 50.0, speedKmh: 100.0)
+        #expect(co2.gramsPerHour > 0)
+        #expect((co2.gramsPerKm ?? 0) > 0)
+
+        // 4. Turbo boost pressure (MAP 220 kPa, BARO 100 kPa)
+        let boost = PowertrainCalculations.turboBoostPressure(mapKpa: 220.0, baroKpa: 100.0)
+        #expect(abs(boost.boostBar - 1.2) < 0.001)
+        #expect(abs(boost.pressureRatio - 2.2) < 0.001)
+        #expect(boost.boostPsi > 17.0)
+    }
+
+    @Test("CAN Intrusion Detector O(1) Sliding Window Entropy")
+    func testCANIntrusionDetectorO1Entropy() async {
+        let detector = CANIntrusionDetector(windowSize: 50)
+        for i in 0..<100 {
+            let payload: [UInt8] = [UInt8(i % 16), UInt8((i * 3) % 256)]
+            let frame = CANSampleFrame(canID: UInt32(0x200 + (i % 4)), payload: payload, timestampSeconds: Double(i) * 0.01)
+            _ = await detector.ingest(frame: frame)
+        }
+        let report = await detector.evaluateSecurity()
+        #expect(report.messageCount == 50)
+        #expect(report.entropy > 0)
+    }
 }
 
 

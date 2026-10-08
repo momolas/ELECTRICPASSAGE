@@ -44,6 +44,7 @@ public final class OBD2Analyzer: Sendable {
         0x02: "Show Freeze Frame Data",
         0x03: "Show Stored DTCs",
         0x04: "Clear DTCs",
+        0x06: "On-Board Monitoring Test Results",
         0x09: "Request Vehicle Information"
     ]
 
@@ -316,6 +317,7 @@ public final class OBD2Analyzer: Sendable {
 
         if isOBD2 {
             // OBD-II Response positive : reqMode + 0x40
+            guard reqMode <= 0xBF else { return nil }
             let expectedPositive = reqMode + 0x40
             guard respBytes.first == expectedPositive else { return nil }
 
@@ -339,6 +341,7 @@ public final class OBD2Analyzer: Sendable {
             }
         } else {
             // UDS/KWP2000 Response positive : reqMode + 0x40
+            guard reqMode <= 0xBF else { return nil }
             let expectedPositive = reqMode + 0x40
             guard respBytes.first == expectedPositive else { return nil }
 
@@ -553,9 +556,123 @@ public final class OBD2Analyzer: Sendable {
         return CANProtocolDetector.detect(canID: canID, payload: data)
     }
 
-    /// Décode les signaux physiques d'une trame SAE J1939 (29 bits) à partir de son PGN
-    public static func decodeJ1939Signals(canID: UInt32, data: Data) -> [J1939Signal] {
-        let header = J1939Header(canID: canID)
-        return J1939Decoder.decode(pgn: header.pgn, data: data)
+    // MARK: - SAE J1979 Mode 06 (On-Board Monitoring)
+
+    public static let mode06MonitorNames: [UInt8: String] = [
+        0x01: "Exhaust Gas Sensor Bank 1 Sensor 1",
+        0x02: "Exhaust Gas Sensor Bank 1 Sensor 2",
+        0x03: "Exhaust Gas Sensor Bank 1 Sensor 3",
+        0x04: "Exhaust Gas Sensor Bank 1 Sensor 4",
+        0x05: "Exhaust Gas Sensor Bank 2 Sensor 1",
+        0x06: "Exhaust Gas Sensor Bank 2 Sensor 2",
+        0x21: "Catalyst Monitor Bank 1",
+        0x22: "Catalyst Monitor Bank 2",
+        0x31: "EGR Monitor Bank 1",
+        0x32: "EGR Monitor Bank 2",
+        0x35: "VVT Monitor Bank 1",
+        0x36: "VVT Monitor Bank 2",
+        0x39: "EVAP Monitor (Cap / Large Leak)",
+        0x3A: "EVAP Monitor (0.040 in Leak)",
+        0x3B: "EVAP Monitor (0.020 in Leak)",
+        0x41: "Secondary Air Monitor",
+        0xA1: "Misfire Monitor General / History",
+        0xA2: "Misfire Cylinder 1 Monitor",
+        0xA3: "Misfire Cylinder 2 Monitor",
+        0xA4: "Misfire Cylinder 3 Monitor",
+        0xA5: "Misfire Cylinder 4 Monitor",
+        0xA6: "Misfire Cylinder 5 Monitor",
+        0xA7: "Misfire Cylinder 6 Monitor",
+        0xA8: "Misfire Cylinder 7 Monitor",
+        0xA9: "Misfire Cylinder 8 Monitor"
+    ]
+
+    /// Structure représentant le résultat d'un test Mode 06 SAE J1979
+    public struct OBD2Mode06TestResult: Sendable, Equatable, Identifiable {
+        public let id: String
+        public let mid: UInt8
+        public let tid: UInt8
+        public let cid: UInt8
+        public let testValue: Double
+        public let minLimit: Double?
+        public let maxLimit: Double?
+        public let monitorName: String
+        public let isPassed: Bool
+
+        public init(
+            mid: UInt8,
+            tid: UInt8,
+            cid: UInt8,
+            testValue: Double,
+            minLimit: Double?,
+            maxLimit: Double?,
+            monitorName: String,
+            isPassed: Bool
+        ) {
+            self.id = String(format: "MID%02X_TID%02X_CID%02X", mid, tid, cid)
+            self.mid = mid
+            self.tid = tid
+            self.cid = cid
+            self.testValue = testValue
+            self.minLimit = minLimit
+            self.maxLimit = maxLimit
+            self.monitorName = monitorName
+            self.isPassed = isPassed
+        }
+    }
+
+    /// Décode une réponse hexadécimale OBD-II Mode 06 (On-Board Monitoring Test Results)
+    public static func decodeMode06(responseHex: String) -> [OBD2Mode06TestResult] {
+        guard let allBytes = HexParsing.bytes(responseHex), !allBytes.isEmpty else { return [] }
+
+        // Retirer l'écho de service 0x46 si présent
+        var payload = allBytes
+        if payload.first == 0x46 {
+            payload.removeFirst()
+        }
+
+        var results: [OBD2Mode06TestResult] = []
+        var offset = 0
+
+        // Format standard CAN SAE J1979 : blocs de 9 octets [MID, TID, CID, ValH, ValL, MinH, MinL, MaxH, MaxL]
+        while offset + 9 <= payload.count {
+            let mid = payload[offset]
+            let tid = payload[offset + 1]
+            let cid = payload[offset + 2]
+
+            let rawVal = (UInt16(payload[offset + 3]) << 8) | UInt16(payload[offset + 4])
+            let rawMin = (UInt16(payload[offset + 5]) << 8) | UInt16(payload[offset + 6])
+            let rawMax = (UInt16(payload[offset + 7]) << 8) | UInt16(payload[offset + 8])
+
+            let testValue = Double(rawVal)
+            let minLimit: Double? = (rawMin == 0xFFFF) ? nil : Double(rawMin)
+            let maxLimit: Double? = (rawMax == 0xFFFF) ? nil : Double(rawMax)
+
+            var passed = true
+            if let min = minLimit, testValue < min {
+                passed = false
+            }
+            if let max = maxLimit, testValue > max {
+                passed = false
+            }
+
+            let monitorName = mode06MonitorNames[mid] ?? String(format: "Monitor MID 0x%02X", mid)
+
+            results.append(
+                OBD2Mode06TestResult(
+                    mid: mid,
+                    tid: tid,
+                    cid: cid,
+                    testValue: testValue,
+                    minLimit: minLimit,
+                    maxLimit: maxLimit,
+                    monitorName: monitorName,
+                    isPassed: passed
+                )
+            )
+
+            offset += 9
+        }
+
+        return results
     }
 }

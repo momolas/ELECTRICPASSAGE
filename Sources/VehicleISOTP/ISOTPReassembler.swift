@@ -48,27 +48,63 @@ public actor ISOTPReassembler {
 
         switch pci {
         case 0: // Single Frame (SF)
-            let length = Int(frame[0] & 0x0F)
-            guard length > 0 else {
-                return .error("Longueur Single Frame invalide (0)")
+            let rawLength = Int(frame[0] & 0x0F)
+            let length: Int
+            let payload: Data.SubSequence
+
+            if rawLength > 0 {
+                // Classic CAN Single Frame (1 à 7 octets)
+                length = rawLength
+                guard frame.count >= length + 1 else {
+                    return .error("Trame Single Frame trop courte pour la longueur déclarée (\(length))")
+                }
+                payload = frame[1...length]
+            } else {
+                // ISO 15765-2:2016 CAN-FD Single Frame (8 à 62 octets)
+                guard frame.count >= 2 else {
+                    return .error("Trame CAN-FD Single Frame incomplète")
+                }
+                length = Int(frame[1])
+                guard length > 0 else {
+                    return .error("Longueur CAN-FD Single Frame invalide (0)")
+                }
+                guard frame.count >= length + 2 else {
+                    return .error("Trame CAN-FD Single Frame trop courte pour la longueur déclarée (\(length))")
+                }
+                payload = frame[2..<(2 + length)]
             }
-            guard frame.count >= length + 1 else {
-                return .error("Trame Single Frame trop courte pour la longueur déclarée (\(length))")
-            }
+
             states.removeValue(forKey: address)
-            let payload = frame[1...length]
             return .completed(Data(payload))
 
         case 1: // First Frame (FF)
             guard frame.count >= 2 else {
                 return .error("Trame First Frame incomplète")
             }
-            let length = Int((UInt16(frame[0] & 0x0F) << 8) | UInt16(frame[1]))
-            guard length > 7 else {
-                return .error("Longueur First Frame invalide (\(length))")
+            let rawLength = Int((UInt16(frame[0] & 0x0F) << 8) | UInt16(frame[1]))
+            let length: Int
+            let payload: Data.SubSequence
+
+            if rawLength == 0 {
+                // ISO 15765-2:2016 CAN-FD First Frame avec longueur étendue sur 32 bits (DL > 4095)
+                guard frame.count >= 6 else {
+                    return .error("Trame CAN-FD First Frame 32-bit incomplète")
+                }
+                let len32 = (UInt32(frame[2]) << 24) | (UInt32(frame[3]) << 16) | (UInt32(frame[4]) << 8) | UInt32(frame[5])
+                length = Int(len32)
+                guard length > 4095 else {
+                    return .error("Longueur CAN-FD First Frame 32-bit invalide (\(length))")
+                }
+                payload = frame[6...]
+            } else {
+                // Classic CAN First Frame (DL <= 4095)
+                length = rawLength
+                guard length > 7 else {
+                    return .error("Longueur First Frame invalide (\(length))")
+                }
+                payload = frame[2...]
             }
 
-            let payload = frame[2...]
             states[address] = ReassemblyState(
                 totalLength: length,
                 buffer: Data(payload),
