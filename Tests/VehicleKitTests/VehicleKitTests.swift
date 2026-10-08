@@ -1355,7 +1355,7 @@ struct VehicleKitTests {
         }
         let report = await detector.evaluateSecurity()
         #expect(report.messageCount == 50)
-        #expect(report.entropy > 0)
+        #expect(report.payloadEntropy > 0)
     }
 }
 
