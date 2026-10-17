@@ -150,10 +150,18 @@ public actor SimulatorEngine: VehicleInterface {
             return formatMode03DTCs()
         }
 
-        // 5. OBD-II Mode 09 (Vehicle Information / VIN)
+        // 5. OBD-II Mode 09 (Vehicle Information / VIN / CalID / CVN)
         if clean.hasPrefix("09") {
             if clean.hasPrefix("0902") {
                 return "49 02 01 56 46 31 4A 4D 30 47 30 44 31 32 33 34 35 36 37 38" // VIN VF1JM0G0D12345678
+            }
+            if clean.hasPrefix("0904") {
+                // 16-char ASCII Calibration ID: "8200399038_S3000"
+                return "49 04 01 38 32 30 30 33 39 39 30 33 38 5F 53 33 30 30 30"
+            }
+            if clean.hasPrefix("0906") {
+                // 4-byte Calibration Verification Number (CVN): A3B8C912
+                return "49 06 01 A3 B8 C9 12"
             }
             return "49" + clean.dropFirst(2) + "00"
         }
@@ -161,10 +169,20 @@ public actor SimulatorEngine: VehicleInterface {
         // 6. Read Data By Identifier UDS (22)
         if clean.hasPrefix("22") {
             let did = String(clean.dropFirst(2).prefix(4))
-            if did == "F190" {
+            switch did {
+            case "F190":
                 return "62F1905646314A4D304730443132333435363738"
+            case "F198":
+                return "62F19838323030333939303338" // "8200399038"
+            case "F188", "F194", "F189":
+                return "62" + did + "38323030353932363131" // "8200592611"
+            case "F191":
+                return "62F19138323030323938343537" // "8200298457"
+            case "F199":
+                return "62F199A3B8C912"
+            default:
+                return "62" + did + "00AA"
             }
-            return "62" + did + "00AA"
         }
 
         // 7. SecurityAccess (27)
@@ -184,6 +202,9 @@ public actor SimulatorEngine: VehicleInterface {
                 return "61 00 01 00 00 00 00 00" // UCH config mock
             } else if lid == "01" {
                 return "61 01 00 01 01 00 00 00" // TdB config mock
+            } else if lid == "80" {
+                // Renault KWP2000 20-byte identification block (MPR 8200399038, VDiag 44, Supplier 003137, HW 8200298457, Prog 00B2, SW 0430, Cal 0105)
+                return "61 80 82 00 39 90 38 44 00 31 37 82 00 29 84 57 00 B2 04 30 01 05"
             } else if lid == "0C" {
                 let rpmVal = UInt16(min(65535.0, max(0.0, state.rpm * 4.0)))
                 return String(format: "61 0C %02X %02X", rpmVal >> 8, rpmVal & 0xFF)

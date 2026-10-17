@@ -1357,7 +1357,80 @@ struct VehicleKitTests {
         #expect(report.messageCount == 50)
         #expect(report.payloadEntropy > 0)
     }
+
+    // MARK: - ECU Calibration & Software Integrity Audit (CalID / CVN / KWP 2180)
+
+    @Test("CalibrationReader OBD-II Mode 09 CalID & CVN Parsing")
+    func testCalibrationReaderMode09Parsing() {
+        // 16-byte ASCII CalID "8200399038_S3000"
+        let calIDResp = "49 04 01 38 32 30 30 33 39 39 30 33 38 5F 53 33 30 30 30"
+        let calIDs = CalibrationReader.parseOBD2CalID(calIDResp)
+        #expect(calIDs == ["8200399038_S3000"])
+
+        // 4-byte CVN A3B8C912
+        let cvnResp = "49 06 01 A3 B8 C9 12"
+        let cvns = CalibrationReader.parseOBD2CVN(cvnResp)
+        #expect(cvns == ["A3B8C912"])
+    }
+
+    @Test("CalibrationReader UDS 0x22 Identification Parsing")
+    func testCalibrationReaderUDSParsing() {
+        let calID = CalibrationReader.parseUDSIdentifier("62 F1 98 38 32 30 30 33 39 39 30 33 38", did: "F198")
+        #expect(calID == "8200399038")
+
+        let cvn = CalibrationReader.parseUDSHexPayload("62 F1 99 A3 B8 C9 12", did: "F199")
+        #expect(cvn == "A3B8C912")
+    }
+
+    @Test("CalibrationReader Renault KWP2000 Service 2180 Block Parsing")
+    func testCalibrationReaderKWP2180Parsing() throws {
+        // 20-byte Renault DDT2000 identification block after 61 80
+        let kwpResp = "61 80 82 00 39 90 38 44 00 31 37 82 00 29 84 57 00 B2 04 30 01 05"
+        let info = try #require(CalibrationReader.parseKWP2000Identification2180(kwpResp))
+
+        #expect(info.primaryCalID == "CAL-0105")
+        #expect(info.hardwareNumber == "HW-8200298457 (MPR 8200399038)")
+        #expect(info.softwareNumber == "SW-00B2-V0430")
+        #expect(info.protocolSource == "KWP2000-2180")
+        #expect(info.isSuspiciousTuningDetected == false)
+    }
+
+    @Test("CalibrationReader Suspicious Tuning & Remap Detection")
+    func testCalibrationReaderTuningDetection() {
+        // 1. Stock calibration
+        let stock = ECUCalibrationInfo(
+            calibrationIDs: ["8200399038_S3000"],
+            calibrationVerificationNumbers: ["A3B8C912"],
+            hardwareNumber: "8200298457",
+            softwareNumber: "8200592611",
+            protocolSource: "OBD2-Mode09"
+        )
+        #expect(stock.isSuspiciousTuningDetected == false)
+
+        // 2. Zeroed CVN after checksum bypass flash
+        let zeroedCVN = ECUCalibrationInfo(
+            calibrationIDs: ["8200399038_S3000"],
+            calibrationVerificationNumbers: ["00000000"],
+            protocolSource: "OBD2-Mode09"
+        )
+        #expect(zeroedCVN.isSuspiciousTuningDetected == true)
+
+        // 3. Stage 1 / EGR-DPF off marker in CalID or SW
+        let stage1 = ECUCalibrationInfo(
+            calibrationIDs: ["STAGE1_EGR_OFF"],
+            calibrationVerificationNumbers: ["DEADBEEF"],
+            protocolSource: "UDS-Service22"
+        )
+        #expect(stage1.isSuspiciousTuningDetected == true)
+    }
+
+    @Test("CalibrationReader Full Multi-Protocol Read on SimulatorEngine")
+    func testCalibrationReaderSimulatorIntegration() async throws {
+        let sim = SimulatorEngine()
+        let info = try #require(await CalibrationReader.read(interface: sim))
+        #expect(info.primaryCalID == "8200399038_S3000")
+        #expect(info.primaryCVN == "A3B8C912")
+        #expect(info.protocolSource == "OBD2-Mode09")
+        #expect(info.isSuspiciousTuningDetected == false)
+    }
 }
-
-
-
