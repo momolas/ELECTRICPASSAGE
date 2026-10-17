@@ -35,7 +35,7 @@ public enum ProfileProbe: Sendable {
                     if normalized.contains("NODATA") || normalized.contains("STOPPED") {
                         continue
                     }
-                    if normalized.contains(positiveResponseCode) {
+                    if !normalized.hasPrefix("7F") && normalized.contains(positiveResponseCode) {
                         supported.append(pidDef.id)
                     }
                 } catch is CancellationError {

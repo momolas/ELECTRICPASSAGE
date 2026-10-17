@@ -15,15 +15,21 @@ public final class FormulaEvaluator: Sendable {
     public func compile(formula: String) -> CompiledFormula? {
         let trimmed = formula.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        return compileTrimmed(trimmed)
+    }
 
+    private func compileTrimmed(_ trimmed: String) -> CompiledFormula? {
+        if let existing = cache.withLock({ $0[trimmed] }) {
+            return existing
+        }
+        guard let node = ASTCompiler.compile(expression: trimmed) else {
+            return nil
+        }
+        let compiled = CompiledFormula(source: trimmed, root: node)
         return cache.withLock { dict in
             if let existing = dict[trimmed] {
                 return existing
             }
-            guard let node = ASTCompiler.compile(expression: trimmed) else {
-                return nil
-            }
-            let compiled = CompiledFormula(source: trimmed, root: node)
             dict[trimmed] = compiled
             return compiled
         }
@@ -34,6 +40,7 @@ public final class FormulaEvaluator: Sendable {
         guard !formula.isEmpty else { return nil }
 
         let trimmed = formula.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
 
         // 1. Chemins ultra-rapides sans compilation pour les formules les plus courantes
         if trimmed == "A" && !bytes.isEmpty {
@@ -56,7 +63,7 @@ public final class FormulaEvaluator: Sendable {
         }
 
         // 2. Compilation ou récupération depuis le cache AST
-        guard let compiled = compile(formula: trimmed) else {
+        guard let compiled = compileTrimmed(trimmed) else {
             return nil
         }
         guard let result = compiled.evaluate(bytes: bytes), result.isFinite else {
@@ -175,11 +182,34 @@ public indirect enum ASTNode: Sendable, Equatable {
             }
 
         case .binary(let op, let leftNode, let rightNode):
-            guard let left = leftNode.evaluate(bytes: bytes),
-                  let right = rightNode.evaluate(bytes: bytes),
-                  left.isFinite, right.isFinite else {
+            guard let left = leftNode.evaluate(bytes: bytes), left.isFinite else {
                 return nil
             }
+
+            // Short-circuit evaluation for logical operators before evaluating rightNode
+            if op == .logicalAnd {
+                if abs(left) < 1e-9 {
+                    return 0.0
+                }
+                guard let right = rightNode.evaluate(bytes: bytes), right.isFinite else {
+                    return nil
+                }
+                return abs(right) >= 1e-9 ? 1.0 : 0.0
+            }
+            if op == .logicalOr {
+                if abs(left) >= 1e-9 {
+                    return 1.0
+                }
+                guard let right = rightNode.evaluate(bytes: bytes), right.isFinite else {
+                    return nil
+                }
+                return abs(right) >= 1e-9 ? 1.0 : 0.0
+            }
+
+            guard let right = rightNode.evaluate(bytes: bytes), right.isFinite else {
+                return nil
+            }
+
             switch op {
             case .add:
                 let res = left + right
@@ -233,49 +263,38 @@ public indirect enum ASTNode: Sendable, Equatable {
                 return left < right ? 1.0 : 0.0
             case .lessThanOrEqual:
                 return left <= right ? 1.0 : 0.0
-            case .logicalAnd:
-                // Sémantique duale : booléenne pure si les deux opérandes sont {0, 1},
-                // sinon bitwise masking pour compatibilité DDT2000 ("A AND 15")
-                let isLeftBool = (abs(left) < 1e-9 || abs(left - 1.0) < 1e-9)
-                let isRightBool = (abs(right) < 1e-9 || abs(right - 1.0) < 1e-9)
-                if isLeftBool && isRightBool {
-                    return (abs(left) > 1e-9 && abs(right) > 1e-9) ? 1.0 : 0.0
-                }
-                guard let l = ASTNode.toInt64(left), let r = ASTNode.toInt64(right) else { return nil }
-                return Double(l & r)
-            case .logicalOr:
-                let isLeftBool = (abs(left) < 1e-9 || abs(left - 1.0) < 1e-9)
-                let isRightBool = (abs(right) < 1e-9 || abs(right - 1.0) < 1e-9)
-                if isLeftBool && isRightBool {
-                    return (abs(left) > 1e-9 || abs(right) > 1e-9) ? 1.0 : 0.0
-                }
-                guard let l = ASTNode.toInt64(left), let r = ASTNode.toInt64(right) else { return nil }
-                return Double(l | r)
+            case .logicalAnd, .logicalOr:
+                return nil
             }
 
         case .function(let fn, let args):
-            let evaluatedArgs = args.compactMap { $0.evaluate(bytes: bytes) }
-            guard evaluatedArgs.count == args.count else { return nil }
-
             switch fn {
             case .min:
-                guard !evaluatedArgs.isEmpty else { return nil }
-                let res = evaluatedArgs.reduce(Double.infinity, min)
-                return res.isFinite ? res : nil
+                guard !args.isEmpty else { return nil }
+                var minVal = Double.infinity
+                for argNode in args {
+                    guard let val = argNode.evaluate(bytes: bytes), val.isFinite else { return nil }
+                    if val < minVal { minVal = val }
+                }
+                return minVal.isFinite ? minVal : nil
             case .max:
-                guard !evaluatedArgs.isEmpty else { return nil }
-                let res = evaluatedArgs.reduce(-Double.infinity, max)
-                return res.isFinite ? res : nil
+                guard !args.isEmpty else { return nil }
+                var maxVal = -Double.infinity
+                for argNode in args {
+                    guard let val = argNode.evaluate(bytes: bytes), val.isFinite else { return nil }
+                    if val > maxVal { maxVal = val }
+                }
+                return maxVal.isFinite ? maxVal : nil
             case .sqrt:
-                guard let arg = evaluatedArgs.first, arg >= 0 else { return nil }
+                guard let first = args.first, let arg = first.evaluate(bytes: bytes), arg.isFinite, arg >= 0 else { return nil }
                 let res = sqrt(arg)
                 return res.isFinite ? res : nil
             case .abs:
-                guard let arg = evaluatedArgs.first else { return nil }
+                guard let first = args.first, let arg = first.evaluate(bytes: bytes), arg.isFinite else { return nil }
                 let res = abs(arg)
                 return res.isFinite ? res : nil
             case .round:
-                guard let arg = evaluatedArgs.first else { return nil }
+                guard let first = args.first, let arg = first.evaluate(bytes: bytes), arg.isFinite else { return nil }
                 let res = round(arg)
                 return res.isFinite ? res : nil
             }
@@ -304,6 +323,8 @@ private enum ASTCompiler {
         case bitwiseOr
         case bitwiseXor
         case bitwiseNot
+        case keywordAnd
+        case keywordOr
         case logicalAnd
         case logicalOr
         case logicalNot
@@ -345,7 +366,7 @@ private enum ASTCompiler {
                 continue
             }
 
-            // Nombres hexadécimaux ou décimaux
+            // Nombres hexadécimaux ou décimaux (incluant la notation scientifique ex: 1e-3, 2.5E+2)
             if c.isNumber || c == "." {
                 if c == "0" && i + 1 < chars.count && (chars[i + 1] == "x" || chars[i + 1] == "X") {
                     i += 2
@@ -364,6 +385,21 @@ private enum ASTCompiler {
                     numStr.append(chars[i])
                     i += 1
                 }
+                if i < chars.count && (chars[i] == "e" || chars[i] == "E") {
+                    numStr.append(chars[i])
+                    i += 1
+                    if i < chars.count && (chars[i] == "+" || chars[i] == "-") {
+                        numStr.append(chars[i])
+                        i += 1
+                    }
+                    var hasExpDigits = false
+                    while i < chars.count && chars[i].isNumber {
+                        numStr.append(chars[i])
+                        hasExpDigits = true
+                        i += 1
+                    }
+                    guard hasExpDigits else { return nil }
+                }
                 guard let val = Double(numStr) else { return nil }
                 tokens.append(.number(val))
                 continue
@@ -379,9 +415,9 @@ private enum ASTCompiler {
                 let upper = word.uppercased()
                 switch upper {
                 case "AND":
-                    tokens.append(.logicalAnd)
+                    tokens.append(.keywordAnd)
                 case "OR":
-                    tokens.append(.logicalOr)
+                    tokens.append(.keywordOr)
                 case "XOR":
                     tokens.append(.bitwiseXor)
                 case "NOT":
@@ -525,20 +561,22 @@ private enum ASTCompiler {
 
     private static func parseLogicalOr(tokens: [Token], index: inout Int) -> ASTNode? {
         guard var left = parseLogicalAnd(tokens: tokens, index: &index) else { return nil }
-        while index < tokens.count && tokens[index] == .logicalOr {
+        while index < tokens.count && (tokens[index] == .logicalOr || tokens[index] == .keywordOr) {
+            let op: ASTNode.BinaryOp = (tokens[index] == .logicalOr) ? .logicalOr : .bitwiseOr
             index += 1
             guard let right = parseLogicalAnd(tokens: tokens, index: &index) else { return nil }
-            left = .binary(.logicalOr, left, right)
+            left = .binary(op, left, right)
         }
         return left
     }
 
     private static func parseLogicalAnd(tokens: [Token], index: inout Int) -> ASTNode? {
         guard var left = parseComparison(tokens: tokens, index: &index) else { return nil }
-        while index < tokens.count && tokens[index] == .logicalAnd {
+        while index < tokens.count && (tokens[index] == .logicalAnd || tokens[index] == .keywordAnd) {
+            let op: ASTNode.BinaryOp = (tokens[index] == .logicalAnd) ? .logicalAnd : .bitwiseAnd
             index += 1
             guard let right = parseComparison(tokens: tokens, index: &index) else { return nil }
-            left = .binary(.logicalAnd, left, right)
+            left = .binary(op, left, right)
         }
         return left
     }

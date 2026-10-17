@@ -95,6 +95,8 @@ public actor Sampler {
 
     private var task: Task<Void, Never>?
     private var stopped = false
+    private var isTickRunning = false
+    private var lastTarget: (tx: String, rx: String?)? = nil
     public private(set) var tickCount: Int = 0
 
     private var strikes: [String: Int] = [:]
@@ -102,6 +104,11 @@ public actor Sampler {
 
     private let rehabEveryNTicks = 60
     private let interQueryGapNs: UInt64 = 20_000_000
+
+    private static let iso8601FormatStyle = Date.ISO8601FormatStyle(
+        includingFractionalSeconds: true,
+        timeZone: TimeZone(secondsFromGMT: 0) ?? .gmt
+    )
 
     public var onValues: (@Sendable ([LiveValue]) -> Void)?
     public var onTick: (@Sendable (TickRow) -> Void)?
@@ -219,6 +226,7 @@ public actor Sampler {
 
     public func stop() {
         stopped = true
+        lastTarget = nil
         task?.cancel()
         task = nil
         for continuation in streamContinuations.values {
@@ -239,6 +247,16 @@ public actor Sampler {
     }
 
     public func runOneTick() async -> TickRow {
+        let startMs = Int(Date.now.timeIntervalSince1970 * 1000)
+        let elapsedMs = startMs - sessionStartMs
+        let timestampISO = Date.now.formatted(Self.iso8601FormatStyle)
+
+        guard !isTickRunning else {
+            return TickRow(timestampISO: timestampISO, elapsedMs: elapsedMs, values: [:])
+        }
+        isTickRunning = true
+        defer { isTickRunning = false }
+
         tickCount += 1
 
         // Réhabilitation périodique des PIDs silencieux
@@ -246,10 +264,6 @@ public actor Sampler {
             disabledPIDs.removeAll()
             strikes.removeAll()
         }
-
-        let startMs = Int(Date.now.timeIntervalSince1970 * 1000)
-        let elapsedMs = startMs - sessionStartMs
-        let timestampISO = Date.now.formatted(Date.ISO8601FormatStyle(includingFractionalSeconds: true, timeZone: TimeZone(secondsFromGMT: 0)!))
 
         var values: [String: String] = [:]
         var liveValuesCollected: [LiveValue] = []
@@ -269,19 +283,27 @@ public actor Sampler {
         for (ecuName, groupPIDs) in groups {
             if Task.isCancelled || stopped { break }
             if let ecu = ecus[ecuName] {
-                _ = try? await driver.setTarget(txID: ecu.requestHeader, rxID: ecu.responseHeader)
+                if lastTarget?.tx != ecu.requestHeader || lastTarget?.rx != ecu.responseHeader {
+                    do {
+                        try await driver.setTarget(txID: ecu.requestHeader, rxID: ecu.responseHeader)
+                        lastTarget = (tx: ecu.requestHeader, rx: ecu.responseHeader)
+                    } catch {
+                        lastTarget = nil
+                    }
+                }
             }
 
             // Séparation des requêtes Mode 01 (éligibles multi-PIDs) et des autres modes
             let mode01Pids = groupPIDs.filter { $0.mode == "01" }
             let otherPids = groupPIDs.filter { $0.mode != "01" }
 
-            // 1. Exécution par lot Multi-PIDs pour Mode 01 (paquets de 4 PIDs)
+            // 1. Exécution par lot Multi-PIDs pour Mode 01 (paquets de 4 PIDs uniques)
             if !mode01Pids.isEmpty {
-                let chunks = mode01Pids.chunked(into: 4)
+                let dedupedMode01 = dedupeByQuery(mode01Pids)
+                let chunks = dedupedMode01.chunked(into: 4)
                 for chunk in chunks {
                     if Task.isCancelled || stopped { break }
-                    let queryPids = Array(Set(chunk.map { $0.pid.uppercased() })).sorted()
+                    let queryPids = chunk.map { $0.pid.uppercased() }
                     let multiRequest = "01" + queryPids.joined()
                     var handled = false
 
@@ -290,41 +312,45 @@ public actor Sampler {
                         try? await Task.sleep(for: .nanoseconds(Int(interQueryGapNs)))
 
                         if let extracted = extractMultiPayloads(response: response, requestedPids: queryPids) {
-                            var missingPids: [PidDef] = []
-                            for def in chunk {
-                                if let payload = extracted[def.pid.uppercased()] {
-                                    strikes[def.id] = 0
-                                    let evaluated = evaluator.evaluate(formula: def.formula, bytes: payload)
-                                    let formatted: String = {
-                                        if let v = evaluated {
-                                            return Self.format(value: v)
+                            var missingGroups: [(mode: String, pid: String, defs: [PidDef])] = []
+                            let now = Date.now
+                            for group in chunk {
+                                if let payload = extracted[group.pid.uppercased()],
+                                   !payload.isEmpty,
+                                   !(payload.count > 1 && payload.allSatisfy({ $0 == 0xFF })) {
+                                    let rawHex = HexParsing.hex(payload)
+                                    for def in group.defs {
+                                        strikes[def.id] = 0
+                                        let evaluated = evaluator.evaluate(formula: def.formula, bytes: payload)
+                                        let formatted: String
+                                        if let evaluated {
+                                            formatted = Self.format(value: evaluated)
                                         } else {
-                                            return HexParsing.hex(payload)
+                                            formatted = rawHex
                                         }
-                                    }()
-                                    values[def.id] = formatted
-                                    let rate = customRates[def.id] ?? Self.defaultSamplingRate(for: def)
-                                    let live = LiveValue(
-                                        pidID: def.id,
-                                        raw: HexParsing.hex(payload),
-                                        value: evaluated,
-                                        unit: def.unit,
-                                        displayName: def.displayName,
-                                        category: def.category,
-                                        samplingRate: rate,
-                                        timestamp: Date.now
-                                    )
-                                    liveValuesCollected.append(live)
+                                        values[def.id] = formatted
+                                        let rate = customRates[def.id] ?? Self.defaultSamplingRate(for: def)
+                                        let live = LiveValue(
+                                            pidID: def.id,
+                                            raw: rawHex,
+                                            value: evaluated,
+                                            unit: def.unit,
+                                            displayName: def.displayName,
+                                            category: def.category,
+                                            samplingRate: rate,
+                                            timestamp: now
+                                        )
+                                        liveValuesCollected.append(live)
+                                    }
                                 } else {
-                                    missingPids.append(def)
+                                    missingGroups.append(group)
                                 }
                             }
 
                             // Fallback unitaire pour les PIDs omis par l'ECU dans la réponse groupée
-                            for def in missingPids {
-                                if let live = await querySinglePid(mode: def.mode, pid: def.pid, def: def, values: &values) {
-                                    liveValuesCollected.append(live)
-                                }
+                            for group in missingGroups {
+                                let lives = await queryPidGroup(mode: group.mode, pid: group.pid, defs: group.defs, values: &values)
+                                liveValuesCollected.append(contentsOf: lives)
                             }
                             handled = true
                         }
@@ -336,23 +362,19 @@ public actor Sampler {
 
                     // Fallback unitaire si la réponse multi-PIDs n'a pas pu être décodée
                     if !handled && !Task.isCancelled && !stopped {
-                        for def in chunk {
-                            if let live = await querySinglePid(mode: def.mode, pid: def.pid, def: def, values: &values) {
-                                liveValuesCollected.append(live)
-                            }
+                        for group in chunk {
+                            let lives = await queryPidGroup(mode: group.mode, pid: group.pid, defs: group.defs, values: &values)
+                            liveValuesCollected.append(contentsOf: lives)
                         }
                     }
                 }
             }
 
-            // 2. Exécution unitaire pour les autres modes (UDS, KWP2000)
+            // 2. Exécution unitaire par groupe de requête pour les autres modes (UDS, KWP2000)
             for (mode, pid, defs) in dedupeByQuery(otherPids) {
                 if Task.isCancelled || stopped { break }
-                for def in defs {
-                    if let live = await querySinglePid(mode: mode, pid: pid, def: def, values: &values) {
-                        liveValuesCollected.append(live)
-                    }
-                }
+                let lives = await queryPidGroup(mode: mode, pid: pid, defs: defs, values: &values)
+                liveValuesCollected.append(contentsOf: lives)
             }
         }
 
@@ -363,52 +385,79 @@ public actor Sampler {
         return TickRow(timestampISO: timestampISO, elapsedMs: elapsedMs, values: values)
     }
 
+    private func queryPidGroup(
+        mode: String,
+        pid: String,
+        defs: [PidDef],
+        values: inout [String: String]
+    ) async -> [LiveValue] {
+        guard let primary = defs.first else { return [] }
+        _ = primary
+        let request = mode + pid
+        let response: String
+        do {
+            response = try await driver.sendDiagnosticRequest(request, timeout: 1.0)
+        } catch is CancellationError {
+            return []
+        } catch {
+            for def in defs { bumpStrike(def.id) }
+            try? await Task.sleep(for: .nanoseconds(Int(interQueryGapNs)))
+            return []
+        }
+
+        try? await Task.sleep(for: .nanoseconds(Int(interQueryGapNs)))
+        let normalized = Self.sanitizeHexResponse(response)
+        if normalized.contains("NODATA") || normalized.contains("STOPPED") {
+            for def in defs { bumpStrike(def.id) }
+            return []
+        }
+        guard let payload = extractPayload(response: response, mode: mode, pid: pid),
+              !payload.isEmpty,
+              !(payload.count > 1 && payload.allSatisfy({ $0 == 0xFF })) else {
+            for def in defs { bumpStrike(def.id) }
+            return []
+        }
+
+        let rawHex = HexParsing.hex(payload)
+        let now = Date.now
+        var liveResults: [LiveValue] = []
+        liveResults.reserveCapacity(defs.count)
+
+        for def in defs {
+            strikes[def.id] = 0
+            let evaluated = evaluator.evaluate(formula: def.formula, bytes: payload)
+            let formatted: String
+            if let evaluated {
+                formatted = Self.format(value: evaluated)
+            } else {
+                formatted = rawHex
+            }
+            values[def.id] = formatted
+            let rate = customRates[def.id] ?? Self.defaultSamplingRate(for: def)
+            liveResults.append(
+                LiveValue(
+                    pidID: def.id,
+                    raw: rawHex,
+                    value: evaluated,
+                    unit: def.unit,
+                    displayName: def.displayName,
+                    category: def.category,
+                    samplingRate: rate,
+                    timestamp: now
+                )
+            )
+        }
+
+        return liveResults
+    }
+
     private func querySinglePid(
         mode: String,
         pid: String,
         def: PidDef,
         values: inout [String: String]
     ) async -> LiveValue? {
-        let request = mode + pid
-        let response: String
-        do {
-            response = try await driver.sendDiagnosticRequest(request, timeout: 1.0)
-        } catch is CancellationError {
-            return nil
-        } catch {
-            bumpStrike(def.id)
-            try? await Task.sleep(for: .nanoseconds(Int(interQueryGapNs)))
-            return nil
-        }
-
-        try? await Task.sleep(for: .nanoseconds(Int(interQueryGapNs)))
-        let normalized = response.uppercased().replacingOccurrences(of: " ", with: "")
-        if normalized.contains("NODATA") || normalized.contains("STOPPED") {
-            bumpStrike(def.id)
-            return nil
-        }
-        guard let payload = extractPayload(response: response, mode: mode, pid: pid),
-              !payload.isEmpty, !payload.allSatisfy({ $0 == 0xFF }) else {
-            bumpStrike(def.id)
-            return nil
-        }
-
-        strikes[def.id] = 0
-        let evaluated = evaluator.evaluate(formula: def.formula, bytes: payload)
-        let formatted = evaluated != nil ? Self.format(value: evaluated!) : HexParsing.hex(payload)
-        values[def.id] = formatted
-        let rate = customRates[def.id] ?? Self.defaultSamplingRate(for: def)
-
-        return LiveValue(
-            pidID: def.id,
-            raw: HexParsing.hex(payload),
-            value: evaluated,
-            unit: def.unit,
-            displayName: def.displayName,
-            category: def.category,
-            samplingRate: rate,
-            timestamp: Date.now
-        )
+        await queryPidGroup(mode: mode, pid: pid, defs: [def], values: &values).first
     }
 
     private func dedupeByQuery(_ pids: [PidDef]) -> [(mode: String, pid: String, defs: [PidDef])] {
@@ -449,10 +498,58 @@ public actor Sampler {
         return String(rounded)
     }
 
+    private static func sanitizeHexResponse(_ response: String) -> String {
+        let lines = response
+            .uppercased()
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let hasFramePrefixes = lines.contains { $0.contains(":") }
+        var cleaned = ""
+        for line in lines {
+            if hasFramePrefixes && !line.contains(":") && line.count <= 4 && line.allSatisfy(\.isHexDigit) {
+                continue
+            }
+            var segment = line
+            while let colonIndex = segment.firstIndex(of: ":") {
+                var start = colonIndex
+                while start > segment.startIndex {
+                    let prev = segment.index(before: start)
+                    if segment[prev].isHexDigit {
+                        start = prev
+                    } else {
+                        break
+                    }
+                }
+                segment.removeSubrange(start...colonIndex)
+            }
+            cleaned += segment.replacing(" ", with: "")
+        }
+        return cleaned
+    }
+
+    private static func expectedByteLength(forMode01Pid pidHex: String) -> Int {
+        switch pidHex.uppercased() {
+        case "00", "20", "40", "60", "80", "A0", "C0": return 4
+        case "01": return 4 // Status since DTCs cleared (MIL / DTC count + monitors)
+        case "03": return 2 // Fuel system status
+        case "14", "15", "16", "17", "18", "19", "1A", "1B": return 2 // O2 sensors voltage / fuel trim
+        case "24", "25", "26", "27", "28", "29", "2A", "2B": return 4 // Wideband O2 sensors (lambda + voltage)
+        case "34", "35", "36", "37", "38", "39", "3A", "3B": return 4 // Wideband O2 sensors (lambda + current)
+        case "41": return 4 // Monitor status this drive cycle
+        case "4F", "50", "51", "52": return 4
+        case "67", "68": return 3 // Multi-sensor temperatures
+        case "0C", "10", "1F", "21", "22", "23", "31", "32", "3C", "3D", "3E", "3F",
+             "42", "43", "44", "4D", "4E", "53", "54", "55", "56", "57", "58", "59", "5A", "5C", "5D", "5E", "63":
+            return 2
+        default: return 1
+        }
+    }
+
     private func extractPayload(response: String, mode: String, pid: String) -> [UInt8]? {
         guard let modeByte = UInt8(mode, radix: 16), modeByte <= 0xBF else { return nil }
         let prefix = String(format: "%02X%@", modeByte + 0x40, pid.uppercased())
-        let clean = response.uppercased().replacingOccurrences(of: " ", with: "")
+        let clean = Self.sanitizeHexResponse(response)
         if let prefixRange = clean.range(of: prefix) {
             let after = String(clean[prefixRange.upperBound...])
             return HexParsing.bytes(after)
@@ -461,7 +558,7 @@ public actor Sampler {
     }
 
     private func extractMultiPayloads(response: String, requestedPids: [String]) -> [String: [UInt8]]? {
-        let clean = response.uppercased().replacingOccurrences(of: " ", with: "")
+        let clean = Self.sanitizeHexResponse(response)
         guard clean.hasPrefix("41") else { return nil }
         guard let allBytes = HexParsing.bytes(clean), allBytes.count >= 2, allBytes[0] == 0x41 else { return nil }
 
@@ -474,18 +571,7 @@ public actor Sampler {
                 continue
             }
 
-            // Déterminer la longueur attendue de ce PID (1, 2 ou 4 octets selon SAE J1979)
-            let length: Int = {
-                switch currentPidHex {
-                case "00", "20", "40", "60", "80", "A0", "C0": return 4
-                case "01": return 4 // Status since DTCs cleared (MIL / DTC count + monitors)
-                case "03": return 2 // Fuel system status
-                case "14", "15", "16", "17", "18", "19", "1A", "1B": return 2 // O2 sensors voltage / fuel trim
-                case "0C", "10", "1F", "21", "22", "23", "31", "32", "3C", "3D", "3E", "3F", "42", "43", "44", "4D", "4E", "53", "54", "59", "5C", "5D", "5E", "63": return 2
-                case "4F", "50", "51", "52": return 4
-                default: return 1
-                }
-            }()
+            let length = Self.expectedByteLength(forMode01Pid: currentPidHex)
 
             let payloadStart = i + 1
             let payloadEnd = payloadStart + length

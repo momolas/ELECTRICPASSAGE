@@ -46,7 +46,7 @@ public enum StandardPIDDiscovery {
         return supported.map { String(format: "%02X", $0) }
     }
 
-    /// Extrait les 4 octets du bitmap de la réponse `41 XX BB BB BB BB`
+    /// Extrait et combine (union bitwise OR) les 4 octets du bitmap de toutes les trames `41 XX BB BB BB BB`
     private static func parseBitmap(response: String, requestedPid: Int) -> UInt32? {
         guard let bytes = HexParsing.bytes(
             response
@@ -56,15 +56,22 @@ public enum StandardPIDDiscovery {
         ), bytes.count >= 6 else { return nil }
 
         let pp = UInt8(requestedPid)
-        for i in 0...(bytes.count - 6) {
+        var combinedBitmap: UInt32 = 0
+        var foundMatch = false
+        var i = 0
+        while i <= bytes.count - 6 {
             if bytes[i] == 0x41 && bytes[i + 1] == pp {
                 let b0 = UInt32(bytes[i + 2])
                 let b1 = UInt32(bytes[i + 3])
                 let b2 = UInt32(bytes[i + 4])
                 let b3 = UInt32(bytes[i + 5])
-                return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+                combinedBitmap |= (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+                foundMatch = true
+                i += 6
+            } else {
+                i += 1
             }
         }
-        return nil
+        return foundMatch ? combinedBitmap : nil
     }
 }

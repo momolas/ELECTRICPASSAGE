@@ -58,7 +58,7 @@ public enum DTCDecoder: Sendable {
 
     /// Extrait une liste de DTCs enrichis avec leur masque de statut (ISO 14229 / ISO 14230).
     public static func decodeDTCsWithStatus(from hexPayload: String) -> [DecodedDTC] {
-        let clean = hexPayload.replacing( " ", with: "")
+        let clean = normalizeHexPayload(hexPayload)
         var results: [DecodedDTC] = []
 
         // 1. OBD-II Mode 03 (43...), Mode 07 (47...), Mode 0A (4A...)
@@ -102,6 +102,9 @@ public enum DTCDecoder: Sendable {
 
         // 3. UDS Service 19 Réponse Positive (59 subfunction SAM DTC_H DTC_M DTC_L Status ...) : Blocs de 4 octets
         if clean.hasPrefix("59") {
+            if clean.hasPrefix("5901") {
+                return []
+            }
             // Supprime 59 + SubFunction (2 chars) + StatusAvailabilityMask (2 chars)
             guard clean.count >= 6 else { return [] }
             let data = String(clean.dropFirst(6))
@@ -122,5 +125,29 @@ public enum DTCDecoder: Sendable {
         }
 
         return results
+    }
+
+    private static func normalizeHexPayload(_ hexPayload: String) -> String {
+        let tokens = hexPayload
+            .components(separatedBy: .whitespacesAndNewlines)
+            .map { $0.trimmingCharacters(in: .whitespaces).uppercased() }
+            .filter { !$0.isEmpty }
+        let hasFramePrefixes = tokens.contains(where: { token in
+            guard let colonIdx = token.firstIndex(of: ":") else { return false }
+            let prefix = token[..<colonIdx]
+            return !prefix.isEmpty && prefix.count <= 2 && prefix.allSatisfy({ $0.isHexDigit })
+        })
+        return tokens.compactMap { token -> String? in
+            if let colonIdx = token.firstIndex(of: ":") {
+                let prefix = token[..<colonIdx]
+                if !prefix.isEmpty && prefix.count <= 2 && prefix.allSatisfy({ $0.isHexDigit }) {
+                    return String(token[token.index(after: colonIdx)...])
+                }
+            }
+            if hasFramePrefixes && token.count == 3 && token.allSatisfy({ $0.isHexDigit }) {
+                return nil
+            }
+            return token
+        }.joined()
     }
 }

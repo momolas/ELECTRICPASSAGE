@@ -92,8 +92,10 @@ public actor CANIntrusionDetector {
             let remainingCount = idCounts[evicted.canID, default: 1] - 1
             if remainingCount <= 0 {
                 idCounts.removeValue(forKey: evicted.canID)
-                idLastTimestamp.removeValue(forKey: evicted.canID)
-                idIntervals.removeValue(forKey: evicted.canID)
+                if idLastTimestamp.count > 256 {
+                    idLastTimestamp.removeValue(forKey: evicted.canID)
+                    idIntervals.removeValue(forKey: evicted.canID)
+                }
             } else {
                 idCounts[evicted.canID] = remainingCount
             }
@@ -112,7 +114,7 @@ public actor CANIntrusionDetector {
         // Calcul des intervalles inter-trames par ID
         if let lastT = idLastTimestamp[frame.canID], lastT.isFinite {
             let dt = frame.timestampSeconds - lastT
-            if dt > 0 {
+            if dt >= 0 {
                 idIntervals[frame.canID, default: []].append(dt)
                 if (idIntervals[frame.canID]?.count ?? 0) > 20 {
                     idIntervals[frame.canID]?.removeFirst()
@@ -179,6 +181,7 @@ public actor CANIntrusionDetector {
                 suspiciousIDs.append(id)
             }
         }
+        suspiciousIDs.sort()
 
         // 4. Calcul du score global d'anomalie
         var score = 0.0
@@ -192,11 +195,13 @@ public actor CANIntrusionDetector {
         } else if !suspiciousIDs.isEmpty {
             score = 0.75
             status = .injectionDetected
-            rationale = "Injection asynchrone suspecte ou fuzzing actif sur les identifiants: \(suspiciousIDs.map { String(format: "0x%X", $0) }.joined(separator: ", "))."
+            let hexList = suspiciousIDs.map { "0x" + String($0, radix: 16, uppercase: true) }.joined(separator: ", ")
+            rationale = "Injection asynchrone suspecte ou fuzzing actif sur les identifiants: \(hexList)."
         } else if entropy > 7.6 {
             score = 0.60
             status = .suspiciousJitter
-            rationale = "Entropie de charge utile anormalement élevée (\(String(format: "%.2f", entropy)) bits/octet), possible flux aléatoire ou payload inconnu."
+            let roundedEntropy = (entropy * 100.0).rounded() / 100.0
+            rationale = "Entropie de charge utile anormalement élevée (\(roundedEntropy) bits/octet), possible flux aléatoire ou payload inconnu."
         }
 
         return BusAnomalyReport(

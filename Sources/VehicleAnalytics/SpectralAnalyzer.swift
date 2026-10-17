@@ -45,7 +45,11 @@ public enum SpectralAnalyzer: Sendable {
         sampleRateHz: Double,
         topPeaksCount: Int = 3
     ) -> SpectralResult? {
-        guard samples.count >= 8, sampleRateHz.isFinite, sampleRateHz > 0, topPeaksCount > 0 else { return nil }
+        guard samples.count >= 8,
+              samples.allSatisfy(\.isFinite),
+              sampleRateHz.isFinite,
+              sampleRateHz > 0,
+              topPeaksCount > 0 else { return nil }
 
         #if canImport(Accelerate)
         return acceleratedDFT(samples: samples, sampleRateHz: sampleRateHz, topPeaksCount: topPeaksCount)
@@ -61,12 +65,15 @@ public enum SpectralAnalyzer: Sendable {
         topPeaksCount: Int
     ) -> SpectralResult? {
         let n = samples.count
+        let mean = vDSP.mean(samples)
+        let centered = vDSP.add(-mean, samples)
+
         guard let setup = vDSP_DFT_zop_CreateSetupD(nil, vDSP_Length(n), .FORWARD) else {
-            return scalarDFT(samples: samples, sampleRateHz: sampleRateHz, topPeaksCount: topPeaksCount)
+            return scalarDFT(samples: centered, sampleRateHz: sampleRateHz, topPeaksCount: topPeaksCount)
         }
         defer { vDSP_DFT_DestroySetupD(setup) }
 
-        var inputReal = samples
+        var inputReal = centered
         var inputImag = [Double](repeating: 0.0, count: n)
         var realOut = [Double](repeating: 0.0, count: n)
         var imagOut = [Double](repeating: 0.0, count: n)
@@ -77,8 +84,8 @@ public enum SpectralAnalyzer: Sendable {
         var magnitudes = [Double](repeating: 0.0, count: halfN)
         // Magnitude = sqrt(real^2 + imag^2) / (n / 2)
         vDSP_vdistD(&realOut, 1, &imagOut, 1, &magnitudes, 1, vDSP_Length(halfN))
-        var scale = 2.0 / Double(n)
-        vDSP_vsmulD(magnitudes, 1, &scale, &magnitudes, 1, vDSP_Length(halfN))
+        let scale = 2.0 / Double(n)
+        magnitudes = vDSP.multiply(scale, magnitudes)
         magnitudes[0] /= 2.0 // Normalisation composante DC
         if n % 2 == 0 {
             magnitudes[halfN - 1] /= 2.0 // Normalisation composante Nyquist
@@ -107,9 +114,12 @@ public enum SpectralAnalyzer: Sendable {
         topPeaksCount: Int
     ) -> SpectralResult {
         let n = samples.count
-        guard n > 0, sampleRateHz.isFinite, sampleRateHz > 0 else {
+        guard n > 0, samples.allSatisfy(\.isFinite), sampleRateHz.isFinite, sampleRateHz > 0 else {
             return SpectralResult(samplingRateHz: max(0.0, sampleRateHz), frequencies: [], magnitudes: [], dominantPeaks: [])
         }
+        let mean = samples.reduce(0.0, +) / Double(n)
+        let centered = samples.map { $0 - mean }
+
         let halfN = (n / 2) + 1
         var frequencies = [Double](repeating: 0.0, count: halfN)
         var magnitudes = [Double](repeating: 0.0, count: halfN)
@@ -121,8 +131,8 @@ public enum SpectralAnalyzer: Sendable {
             var sumImag = 0.0
             for t in 0..<n {
                 let angle = 2.0 * Double.pi * Double(k * t) / Double(n)
-                sumReal += samples[t] * cos(angle)
-                sumImag -= samples[t] * sin(angle)
+                sumReal += centered[t] * cos(angle)
+                sumImag -= centered[t] * sin(angle)
             }
             let rawMag = sqrt(sumReal * sumReal + sumImag * sumImag)
             let isDCOrNyquist = (k == 0) || (k == n / 2 && n % 2 == 0)
@@ -144,13 +154,30 @@ public enum SpectralAnalyzer: Sendable {
         topCount: Int
     ) -> [SpectralResult.Peak] {
         guard frequencies.count == magnitudes.count, !frequencies.isEmpty, topCount > 0 else { return [] }
-        // Ignorer la composante continue (DC / k=0) pour la détection de pics oscillants
-        var indexedPeaks: [(freq: Double, mag: Double)] = []
+        // Ignorer la composante continue (DC / k=0) et privilégier les maxima locaux
+        var localMaxPeaks: [(index: Int, freq: Double, mag: Double)] = []
+        var fallbackPeaks: [(index: Int, freq: Double, mag: Double)] = []
+
         for i in 1..<frequencies.count {
-            indexedPeaks.append((frequencies[i], magnitudes[i]))
+            let isLocalMax = i > 1 && i + 1 < magnitudes.count &&
+                magnitudes[i] >= magnitudes[i - 1] &&
+                magnitudes[i] >= magnitudes[i + 1]
+            if isLocalMax {
+                localMaxPeaks.append((i, frequencies[i], magnitudes[i]))
+            } else {
+                fallbackPeaks.append((i, frequencies[i], magnitudes[i]))
+            }
         }
-        let sorted = indexedPeaks.sorted { $0.mag > $1.mag }
-        let safeCount = min(sorted.count, topCount)
-        return sorted.prefix(safeCount).map { SpectralResult.Peak(frequencyHz: $0.freq, magnitude: $0.mag) }
+
+        var selected = localMaxPeaks.sorted { $0.mag > $1.mag }
+        if selected.count < topCount {
+            let remaining = fallbackPeaks.sorted { $0.mag > $1.mag }
+            selected.append(contentsOf: remaining.prefix(topCount - selected.count))
+        }
+
+        let safeCount = min(selected.count, topCount)
+        return selected.prefix(safeCount).map {
+            SpectralResult.Peak(frequencyHz: $0.freq, magnitude: $0.mag)
+        }
     }
 }

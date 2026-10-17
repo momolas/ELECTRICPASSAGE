@@ -20,6 +20,7 @@ public enum SignalFilter: Sendable {
             public var x2: Double = 0.0
             public var y1: Double = 0.0
             public var y2: Double = 0.0
+            public var isInitialized: Bool = false
             public init() {}
         }
 
@@ -63,6 +64,13 @@ public enum SignalFilter: Sendable {
         /// Filtre un échantillon unique en mettant à jour l'état glissant (latence nulle)
         public func filter(sample: Double, state: inout State) -> Double {
             guard sample.isFinite else { return state.y1 }
+            if !state.isInitialized {
+                state.x1 = sample
+                state.x2 = sample
+                state.y1 = sample
+                state.y2 = sample
+                state.isInitialized = true
+            }
             let y = (b0 * sample) + (b1 * state.x1) + (b2 * state.x2) - (a1 * state.y1) - (a2 * state.y2)
             guard y.isFinite else { return state.y1 }
             state.x2 = state.x1
@@ -115,16 +123,10 @@ public enum SignalFilter: Sendable {
         let half = effectiveWindow / 2
         var result = values
 
-        let lastFinite = values.last(where: { $0.isFinite }) ?? firstFinite
-        for i in 0..<half {
-            if !result[i].isFinite { result[i] = firstFinite }
-        }
-        for i in (values.count - half)..<values.count {
-            if !result[i].isFinite { result[i] = lastFinite }
-        }
-
-        for i in half..<(values.count - half) {
-            let window = values[(i - half)...(i + half)].filter { $0.isFinite }.sorted()
+        for i in 0..<values.count {
+            let lower = max(0, i - half)
+            let upper = min(values.count - 1, i + half)
+            let window = values[lower...upper].filter { $0.isFinite }.sorted()
             if !window.isEmpty {
                 result[i] = window[window.count / 2]
             } else {

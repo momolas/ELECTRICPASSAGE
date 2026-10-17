@@ -78,9 +78,10 @@ public enum BatteryHealthEstimator: Sendable {
         // Résistance interne en milli-Ohms : Ri = (V_rest - V_crank) / I * 1000
         let riMilliOhms = (deltaV / current) * 1000.0
 
-        // Correction thermique de résistance interne
-        let tempFactor = 1.0 + (20.0 - temperatureCelsius) * 0.005
-        let normalizedRi = riMilliOhms / max(0.5, tempFactor)
+        // Correction thermique de résistance interne (clampée >= 1.0 pour éviter de pénaliser T > 20°C)
+        let safeTemp = temperatureCelsius.isFinite ? temperatureCelsius : 20.0
+        let tempFactor = max(1.0, 1.0 + (20.0 - safeTemp) * 0.012)
+        let normalizedRi = riMilliOhms / tempFactor
 
         // SOH calculé par rapport à une batterie neuve (Ri nominale ≈ 4 à 5 mΩ)
         // Au-delà de 18-20 mΩ, la batterie est considérée en fin de vie
@@ -89,21 +90,29 @@ public enum BatteryHealthEstimator: Sendable {
         let rawSOH = 100.0 - ((normalizedRi - baselineRi) / (endOfLifeRi - baselineRi) * 100.0)
         let clampedSOH = min(100.0, max(0.0, rawSOH))
 
+        func formatOneDecimal(_ value: Double) -> String {
+            "\((value * 10.0).rounded() / 10.0)"
+        }
+
         let status: BatteryHealthReport.HealthStatus
         let summary: String
 
         if minimumCrankingVoltage < 9.0 || clampedSOH < 40.0 {
             status = .replaceImmediate
-            summary = "Chute de tension critique au démarrage (\(String(format: "%.1f", minimumCrankingVoltage)) V), risque élevé de panne imminente."
-        } else if minimumCrankingVoltage < 9.8 || clampedSOH < 65.0 {
+            summary = "Chute de tension critique au démarrage (\(formatOneDecimal(minimumCrankingVoltage)) V), risque élevé de panne imminente."
+        } else if minimumCrankingVoltage < 9.8 || clampedSOH < 65.0 || restingVoltage < 12.1 {
             status = .weakNeedsRecharge
-            summary = "Résistance interne élevée (\(String(format: "%.1f", riMilliOhms)) mΩ). Batterie fatiguée ou déchargée."
+            if restingVoltage < 12.1 {
+                summary = "Tension de repos faible (\(formatOneDecimal(restingVoltage)) V). Batterie déchargée, recharge requise."
+            } else {
+                summary = "Résistance interne élevée (\(formatOneDecimal(riMilliOhms)) mΩ). Batterie fatiguée ou déchargée."
+            }
         } else if clampedSOH < 85.0 {
             status = .good
             summary = "Batterie en état d'usage satisfaisant (SOH: \(Int(clampedSOH))%)."
         } else {
             status = .excellent
-            summary = "Batterie en excellente condition (Ri: \(String(format: "%.1f", riMilliOhms)) mΩ, SOH: \(Int(clampedSOH))%)."
+            summary = "Batterie en excellente condition (Ri: \(formatOneDecimal(riMilliOhms)) mΩ, SOH: \(Int(clampedSOH))%)."
         }
 
         return BatteryHealthReport(

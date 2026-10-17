@@ -68,6 +68,10 @@ public actor UDSClient {
     }
 
     public func stop() {
+        stopTesterPresent()
+    }
+
+    public func stopTesterPresent() {
         testerPresentTask?.cancel()
         testerPresentTask = nil
     }
@@ -80,8 +84,10 @@ public actor UDSClient {
         let response = try await sendRaw(hexCmd)
         try validatePositiveResponse(response, expectedSID: 0x10)
 
-        if keepAlive {
+        if keepAlive && sessionType != 0x01 {
             startTesterPresentLoop()
+        } else {
+            stopTesterPresent()
         }
         return response
     }
@@ -118,7 +124,7 @@ public actor UDSClient {
         let response = try await sendRaw(hexCmd)
         try validatePositiveResponse(response, expectedSID: 0x22)
         
-        let clean = response.replacing( " ", with: "")
+        let clean = response.replacing(" ", with: "")
         // Enlève 62 + DID (6 caractères)
         guard clean.count >= 6 else { return "" }
         return String(clean.dropFirst(6))
@@ -127,7 +133,7 @@ public actor UDSClient {
     // MARK: - WriteDataByIdentifier (0x2E)
 
     public func writeDataByIdentifier(_ did: UInt16, dataHex: String) async throws {
-        let cleanData = dataHex.replacing( " ", with: "")
+        let cleanData = dataHex.replacing(" ", with: "")
         let hexCmd = String(format: "2E%04X%@", did, cleanData)
         let response = try await sendRaw(hexCmd)
         try validatePositiveResponse(response, expectedSID: 0x2E)
@@ -152,6 +158,9 @@ public actor UDSClient {
 
         // 1. Request Seed (27 + Odd Subfunction)
         let requestLevel = level % 2 == 0 ? level - 1 : level
+        guard requestLevel < 0xFF else {
+            throw UDSError.invalidResponseFormat("Niveau SecurityAccess invalide: 0x\(String(format: "%02X", level))")
+        }
         let seedCmd = String(format: "27%02X", requestLevel)
         let seedResponse = try await sendRaw(seedCmd)
         try validatePositiveResponse(seedResponse, expectedSID: 0x27)
@@ -161,6 +170,9 @@ public actor UDSClient {
             throw UDSError.invalidResponseFormat("Graine UDS trop courte: \(seedResponse)")
         }
         let seed = String(cleanSeedResp.dropFirst(4))
+        guard !seed.isEmpty else {
+            throw UDSError.invalidResponseFormat("Graine UDS vide: \(seedResponse)")
+        }
 
         // Si la graine est déjà zéro, l'accès est déjà déverrouillé
         if seed.allSatisfy({ $0 == "0" }) {
@@ -168,7 +180,8 @@ public actor UDSClient {
         }
 
         // 2. Send Key (27 + Even Subfunction)
-        let key = try await keyCalculation(seed)
+        let rawKey = try await keyCalculation(seed)
+        let key = rawKey.replacing(" ", with: "").uppercased()
         let sendKeyLevel = requestLevel + 1
         let keyCmd = String(format: "27%02X%@", sendKeyLevel, key)
         let keyResponse = try await sendRaw(keyCmd)
@@ -235,14 +248,36 @@ public actor UDSClient {
     private func sendRaw(_ hex: String) async throws -> String {
         do {
             let res = try await interface.sendDiagnosticRequest(hex, timeout: 2.0)
-            return res.replacing( " ", with: "")
+            var clean = res
+                .replacing(" ", with: "")
+                .replacing("\n", with: "")
+                .replacing("\r", with: "")
+                .uppercased()
+            let cleanReq = hex.replacing(" ", with: "").uppercased()
+            if cleanReq.count >= 2 {
+                let sidPrefix = String(cleanReq.prefix(2))
+                let pendingPrefix = "7F\(sidPrefix)78"
+                while clean.hasPrefix(pendingPrefix) && clean.count > 6 {
+                    clean = String(clean.dropFirst(6))
+                }
+            }
+            return clean
         } catch {
             throw UDSError.transportError(error.localizedDescription)
         }
     }
 
     private func validatePositiveResponse(_ responseHex: String, expectedSID: UInt8) throws {
-        let clean = responseHex.replacing( " ", with: "").uppercased()
+        var clean = responseHex
+            .replacing(" ", with: "")
+            .replacing("\n", with: "")
+            .replacing("\r", with: "")
+            .uppercased()
+
+        let pendingPrefix = String(format: "7F%02X78", expectedSID)
+        while clean.hasPrefix(pendingPrefix) && clean.count > 6 {
+            clean = String(clean.dropFirst(6))
+        }
 
         if clean.hasPrefix("7F") {
             guard clean.count >= 6 else {

@@ -54,14 +54,6 @@ public struct PidDef: Identifiable, Hashable, Sendable {
         self.max = max
     }
 
-    public static func == (lhs: PidDef, rhs: PidDef) -> Bool {
-        lhs.id == rhs.id
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-
     public enum CodingKeys: String, CodingKey, Sendable {
         case id
         case displayName = "display_name"
@@ -197,15 +189,6 @@ public struct ValidationEntry: Hashable, Sendable {
         self.date = date
         self.notes = notes
     }
-
-    public static func == (lhs: ValidationEntry, rhs: ValidationEntry) -> Bool {
-        lhs.vehicle == rhs.vehicle && lhs.date == rhs.date
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(vehicle)
-        hasher.combine(date)
-    }
 }
 
 extension ValidationEntry: Codable {
@@ -247,14 +230,6 @@ public struct Profile: Identifiable, Hashable, Sendable {
         self.pids = pids
         self.sources = sources
         self.validatedAgainst = validatedAgainst
-    }
-
-    public static func == (lhs: Profile, rhs: Profile) -> Bool {
-        lhs.profileId == rhs.profileId
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(profileId)
     }
 
     public static var fallback: Profile {

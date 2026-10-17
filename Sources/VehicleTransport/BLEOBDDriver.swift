@@ -58,11 +58,6 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
         super.init()
     }
 
-    deinit {
-        timeoutTask?.cancel()
-        responseContinuation?.resume(throwing: CancellationError())
-    }
-
     // MARK: - VehicleInterface Lifecycle
 
     public func connect() async throws {
@@ -90,22 +85,28 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
     }
 
     public func setTarget(txID: String, rxID: String?) async throws {
-        let cleanTx = txID.lowercased().hasPrefix("0x") ? String(txID.dropFirst(2)) : txID
+        let trimmedTx = txID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanTx = trimmedTx.lowercased().hasPrefix("0x") ? String(trimmedTx.dropFirst(2)) : trimmedTx
         self.currentTx = cleanTx
         if let rxID {
-            let cleanRx = rxID.lowercased().hasPrefix("0x") ? String(rxID.dropFirst(2)) : rxID
+            let trimmedRx = rxID.trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleanRx = trimmedRx.lowercased().hasPrefix("0x") ? String(trimmedRx.dropFirst(2)) : trimmedRx
             self.currentRx = cleanRx
         } else {
             let txVal = UInt32(cleanTx, radix: 16) ?? 0x7E0
-            self.currentRx = String(format: "%X", txVal + 8)
+            if (0x740...0x75F).contains(txVal) {
+                self.currentRx = String(txVal + 0x20, radix: 16, uppercase: true)
+            } else if txVal > 0x7FF {
+                let swapped = (txVal & 0xFFFF0000) | ((txVal & 0x000000FF) << 8) | ((txVal & 0x0000FF00) >> 8)
+                self.currentRx = String(swapped, radix: 16, uppercase: true)
+            } else {
+                self.currentRx = String(txVal + 8, radix: 16, uppercase: true)
+            }
         }
 
-        // Si connecté à un adaptateur ELM/STN, configure les filtres d'en-tête
+        // Si connecté à un adaptateur ELM/STN, configure les filtres d'en-tête et de réception
         _ = try? await sendDiagnosticRequest("ATSH" + cleanTx, timeout: 0.5)
-        if let rxID {
-            let cleanRx = rxID.lowercased().hasPrefix("0x") ? String(rxID.dropFirst(2)) : rxID
-            _ = try? await sendDiagnosticRequest("ATCRA" + cleanRx, timeout: 0.5)
-        }
+        _ = try? await sendDiagnosticRequest("ATCRA" + self.currentRx, timeout: 0.5)
     }
 
     public func sendDiagnosticRequest(_ requestHex: String, timeout: TimeInterval = 2.0) async throws -> String {
@@ -117,10 +118,12 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
 
         // En mode réel avec périphérique BLE configuré
         if let peripheral, let writeChar = self.writeCharacteristic {
-            guard responseContinuation == nil else {
-                throw NSError(domain: "BLEOBDDriver", code: -4, userInfo: [NSLocalizedDescriptionKey: "Requête BLE déjà en cours"])
+            while self.responseContinuation != nil {
+                try Task.checkCancellation()
+                try await Task.sleep(for: .milliseconds(20))
             }
 
+            try Task.checkCancellation()
             guard let payloadData = (cleanCmd + "\r").data(using: .utf8) else {
                 throw NSError(domain: "BLEOBDDriver", code: -2, userInfo: [NSLocalizedDescriptionKey: "Commande invalide."])
             }
@@ -135,6 +138,10 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
             // Attente de réponse asynchrone avec prompt '>' sécurisée contre les timeouts zombies et l'annulation
             return try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
+                    if Task.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
                     self.responseContinuation = continuation
                     self.timeoutTask?.cancel()
                     self.timeoutTask = Task { [weak self] in
@@ -160,8 +167,12 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
             return "41 0C 0B B8" // 750 RPM
         } else if upper.hasPrefix("010D") {
             return "41 0D 32" // 50 km/h
-        } else if upper.hasPrefix("03") || upper.hasPrefix("07") {
+        } else if upper.hasPrefix("03") {
             return "43 01 02 00 00 00 00" // P0102 conforme SAE J1979 sans octet de compte parasite
+        } else if upper.hasPrefix("07") {
+            return "47 01 02 00 00 00 00"
+        } else if upper.hasPrefix("0A") {
+            return "4A 01 02 00 00 00 00"
         } else if upper.hasPrefix("1902") {
             return "59 02 FF 01 02 00 2F" // UDS DTC P0102 actif + confirmé
         } else if upper.hasPrefix("22F190") {
@@ -173,9 +184,10 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
 
     public func sendRawCAN(id: UInt32, data: Data, bus: UInt8) async throws {
         // Envoi d'une trame CAN brute via commande STN/ELM
-        let hex = HexParsing.hex(Array(data))
-        let cmd = String(format: "ATSH%X\r%@", id, hex)
-        _ = try? await sendDiagnosticRequest(cmd, timeout: 0.5)
+        let hexID = String(id, radix: 16, uppercase: true)
+        let hexPayload = HexParsing.hex(Array(data))
+        _ = try? await sendDiagnosticRequest("ATSH" + hexID, timeout: 0.5)
+        _ = try? await sendDiagnosticRequest(hexPayload, timeout: 0.5)
     }
 
     // MARK: - Réception des octets BLE & Gestion des Délais
@@ -198,7 +210,8 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
     }
 
     public func handleReceivedData(_ data: Data) {
-        guard let text = String(data: data, encoding: .utf8) else { return }
+        guard self.responseContinuation != nil else { return }
+        let text = String(decoding: data, as: UTF8.self)
         responseBuffer += text
 
         // Détection de fin de réponse ELM327 (caractère prompt '>')

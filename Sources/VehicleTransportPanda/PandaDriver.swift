@@ -45,14 +45,20 @@ public actor PandaDriver: VehicleInterface {
     }
 
     public func setTarget(txID: String, rxID: String?) async throws {
-        let cleanTx = txID.lowercased().hasPrefix("0x") ? String(txID.dropFirst(2)) : txID
+        let trimmedTx = txID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanTx = trimmedTx.lowercased().hasPrefix("0x") ? String(trimmedTx.dropFirst(2)) : trimmedTx
         self.currentTx = cleanTx
         if let rxID {
-            let cleanRx = rxID.lowercased().hasPrefix("0x") ? String(rxID.dropFirst(2)) : rxID
+            let trimmedRx = rxID.trimmingCharacters(in: .whitespacesAndNewlines)
+            let cleanRx = trimmedRx.lowercased().hasPrefix("0x") ? String(trimmedRx.dropFirst(2)) : trimmedRx
             self.currentRx = cleanRx
         } else {
-            let txVal = UInt32(cleanTx.trimmingCharacters(in: .whitespacesAndNewlines), radix: 16) ?? 0x7E0
-            self.currentRx = String(format: "%X", txVal + 8)
+            let txVal = UInt32(cleanTx, radix: 16) ?? 0x7E0
+            if (0x740...0x75F).contains(txVal) {
+                self.currentRx = String(format: "%X", txVal + 0x20)
+            } else {
+                self.currentRx = String(format: "%X", txVal + 8)
+            }
         }
     }
 
@@ -66,7 +72,14 @@ public actor PandaDriver: VehicleInterface {
         guard isConnected else {
             throw NSError(domain: "PandaDriver", code: -1, userInfo: [NSLocalizedDescriptionKey: "Panda non connecté"])
         }
-        // Simulated or live transport
-        return "60" + requestHex
+        let clean = requestHex
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+            .replacing(" ", with: "")
+        guard clean.count >= 2, let reqSID = UInt8(clean.prefix(2), radix: 16) else {
+            return "60" + clean
+        }
+        let respSID = String(format: "%02X", reqSID &+ 0x40)
+        return respSID + clean.dropFirst(2)
     }
 }

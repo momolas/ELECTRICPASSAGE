@@ -6,6 +6,7 @@ public actor DoIPClient: VehicleInterface {
 
     public private(set) var isConnected: Bool = false
     public private(set) var isRoutingActivated: Bool = false
+    private var isConnecting: Bool = false
     
     private var sourceAddress: UInt16 = 0x0E00 // Adresse logique testeur standard DoIP
     private var targetLogicalAddress: UInt16 = 0x0E80 // Adresse logique ECU par défaut (ex: 0x7E0 / 0x17FC)
@@ -20,10 +21,13 @@ public actor DoIPClient: VehicleInterface {
 
     public func connect() async throws {
         // Initialisation de session DoIP
-        self.isConnected = true
+        self.isConnecting = true
         do {
             try await activateRouting()
+            self.isConnecting = false
+            self.isConnected = true
         } catch {
+            self.isConnecting = false
             self.isConnected = false
             self.isRoutingActivated = false
             throw error
@@ -31,20 +35,22 @@ public actor DoIPClient: VehicleInterface {
     }
 
     public func disconnect() async {
+        self.isConnecting = false
         self.isConnected = false
         self.isRoutingActivated = false
     }
 
     public func setTarget(txID: String, rxID: String?) async throws {
-        let clean = txID.lowercased().hasPrefix("0x") ? String(txID.dropFirst(2)) : txID
-        if let target = UInt16(clean.trimmingCharacters(in: .whitespacesAndNewlines), radix: 16) {
+        let trimmed = txID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clean = trimmed.lowercased().hasPrefix("0x") ? String(trimmed.dropFirst(2)) : trimmed
+        if let target = UInt16(clean, radix: 16) {
             self.targetLogicalAddress = target
         }
     }
 
     /// Active le routage logique TCP selon l'ISO 13400 (Type 0x0005)
     public func activateRouting(activationType: UInt8 = 0x00) async throws {
-        guard isConnected else {
+        guard isConnected || isConnecting else {
             throw NSError(domain: "DoIPClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "Client DoIP non connecté."])
         }
 
@@ -67,7 +73,10 @@ public actor DoIPClient: VehicleInterface {
             throw NSError(domain: "DoIPClient", code: -1, userInfo: [NSLocalizedDescriptionKey: "DoIP non connecté ou routage non activé"])
         }
 
-        let cleanHex = requestHex.replacing( " ", with: "")
+        let cleanHex = requestHex
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+            .replacing(" ", with: "")
         guard let udsPayload = HexParsing.bytes(cleanHex) else {
             throw NSError(domain: "DoIPClient", code: -2, userInfo: [NSLocalizedDescriptionKey: "Payload hexadécimal invalide: \(requestHex)"])
         }

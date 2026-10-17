@@ -117,7 +117,9 @@ public actor SimulatorEngine: VehicleInterface {
     }
 
     public func sendDiagnosticRequest(_ requestHex: String, timeout: TimeInterval = 2.0) async throws -> String {
-        let clean = requestHex.replacingOccurrences(of: " ", with: "").uppercased()
+        let clean = requestHex.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: " ", with: "")
+            .uppercased()
 
         // 1. Session request (10)
         if clean.hasPrefix("10") {
@@ -139,15 +141,49 @@ public actor SimulatorEngine: VehicleInterface {
             return "44"
         }
 
-        // 4. Read DTC Info UDS (19) & OBD-II Mode 03/07/0A
+        // 4. Read DTC Info UDS (19), KWP2000 (18) & OBD-II Mode 03/07/0A
         if clean.hasPrefix("19") {
             if state.activeDTCs.isEmpty {
-                return "5902FF00"
+                return "5902FF"
             }
-            return "5902FF0102002F"
+            var pieces = "5902FF"
+            for dtc in state.activeDTCs {
+                let bytes = encodeDTC(dtc)
+                if bytes == [0x00, 0x00] && dtc != "P0000" {
+                    pieces += "0102002F"
+                } else {
+                    pieces += String(format: "%02X%02X002F", bytes[0], bytes[1])
+                }
+            }
+            return pieces
         }
-        if clean.hasPrefix("03") || clean.hasPrefix("07") || clean.hasPrefix("0A") {
-            return formatMode03DTCs()
+        if clean.hasPrefix("18") {
+            if state.activeDTCs.isEmpty {
+                return "58 00"
+            }
+            var pieces: [String] = [String(format: "58 %02X", state.activeDTCs.count)]
+            for dtc in state.activeDTCs {
+                let bytes = encodeDTC(dtc)
+                if bytes == [0x00, 0x00] && dtc != "P0000" {
+                    pieces.append("01 02 2F")
+                } else {
+                    pieces.append(String(format: "%02X %02X 2F", bytes[0], bytes[1]))
+                }
+            }
+            return pieces.joined(separator: " ")
+        }
+        if clean.hasPrefix("1A") {
+            let eid = String(clean.dropFirst(2).prefix(2))
+            return "5A " + (eid.isEmpty ? "80" : eid) + " 56 46 31 4A 4D 30 47 30 44 31 32 33 34 35 36 37 38"
+        }
+        if clean.hasPrefix("03") {
+            return formatMode03DTCs(responseSID: "43")
+        }
+        if clean.hasPrefix("07") {
+            return formatMode03DTCs(responseSID: "47")
+        }
+        if clean.hasPrefix("0A") {
+            return formatMode03DTCs(responseSID: "4A")
         }
 
         // 5. OBD-II Mode 09 (Vehicle Information / VIN / CalID / CVN)
@@ -205,6 +241,8 @@ public actor SimulatorEngine: VehicleInterface {
             } else if lid == "80" {
                 // Renault KWP2000 20-byte identification block (MPR 8200399038, VDiag 44, Supplier 003137, HW 8200298457, Prog 00B2, SW 0430, Cal 0105)
                 return "61 80 82 00 39 90 38 44 00 31 37 82 00 29 84 57 00 B2 04 30 01 05"
+            } else if lid == "81" {
+                return "61 81 56 46 31 4A 4D 30 47 30 44 31 32 33 34 35 36 37 38"
             } else if lid == "0C" {
                 let rpmVal = UInt16(min(65535.0, max(0.0, state.rpm * 4.0)))
                 return String(format: "61 0C %02X %02X", rpmVal >> 8, rpmVal & 0xFF)
@@ -221,9 +259,27 @@ public actor SimulatorEngine: VehicleInterface {
             return "7B" + lid
         }
 
-        // 10. Routine Control / Actuators (30 / 31)
-        if clean.hasPrefix("30") || clean.hasPrefix("31") {
+        // 10. Routine Control / Actuators (30 / 31) & Download/Upload (34 / 35 / 36 / 37)
+        if clean.hasPrefix("30") {
+            return "70" + clean.dropFirst(2).prefix(2)
+        }
+        if clean.hasPrefix("31") {
+            if clean.count >= 8 {
+                return "71" + clean.dropFirst(2).prefix(6)
+            }
             return "7101"
+        }
+        if clean.hasPrefix("34") {
+            return "74 20"
+        }
+        if clean.hasPrefix("35") {
+            return "75 20"
+        }
+        if clean.hasPrefix("36") {
+            return "76"
+        }
+        if clean.hasPrefix("37") {
+            return "77"
         }
 
         // 11. Tester Present (3E)
@@ -304,6 +360,9 @@ public actor SimulatorEngine: VehicleInterface {
         switch pid {
         case "00":
             return "BE 3E B8 11" // Support 01-20
+        case "01":
+            let byteA = (state.milActive ? 0x80 : 0x00) | min(state.activeDTCs.count, 127)
+            return String(format: "%02X 07 E5 00", byteA)
         case "20":
             return "80 00 00 01" // Support 21-40 avec bit de continuation
         case "40":
@@ -352,17 +411,17 @@ public actor SimulatorEngine: VehicleInterface {
         }
     }
 
-    private func formatMode03DTCs() -> String {
+    private func formatMode03DTCs(responseSID: String = "43") -> String {
         guard !state.activeDTCs.isEmpty else {
-            return "43 00 00 00 00 00 00"
+            return "\(responseSID) 00 00 00 00 00 00"
         }
 
-        var pieces: [String] = ["43"]
+        var pieces: [String] = [responseSID]
         for dtc in state.activeDTCs {
             let bytes = encodeDTC(dtc)
             pieces.append(String(format: "%02X %02X", bytes[0], bytes[1]))
         }
-        // Compléter pour un alignement propre de trame CAN standard (43 + 3 codes défauts de 2 octets = 7 octets)
+        // Compléter pour un alignement propre de trame CAN standard (SID + 3 codes défauts de 2 octets = 7 octets)
         while pieces.count < 4 {
             pieces.append("00 00")
         }

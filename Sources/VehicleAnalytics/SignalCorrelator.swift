@@ -51,23 +51,22 @@ public enum SignalCorrelator: Sendable {
 
     /// Calcule le coefficient de corrélation linéaire de Pearson entre deux séries
     public static func pearsonCorrelation(x: [Double], y: [Double]) -> Double? {
-        guard x.count == y.count, x.count >= 2 else { return nil }
+        guard x.count == y.count, x.count >= 2,
+              x.allSatisfy(\.isFinite), y.allSatisfy(\.isFinite) else { return nil }
 
         #if canImport(Accelerate)
-        let n = Double(x.count)
         let meanX = vDSP.mean(x)
         let meanY = vDSP.mean(y)
 
-        let sumXY = vDSP.dot(x, y)
-        let sumXX = vDSP.dot(x, x)
-        let sumYY = vDSP.dot(y, y)
+        let dx = vDSP.add(-meanX, x)
+        let dy = vDSP.add(-meanY, y)
 
-        let num = sumXY - n * meanX * meanY
-        let denX = max(0.0, sumXX - n * meanX * meanX)
-        let denY = max(0.0, sumYY - n * meanY * meanY)
+        let num = vDSP.dot(dx, dy)
+        let denX = vDSP.dot(dx, dx)
+        let denY = vDSP.dot(dy, dy)
 
         guard denX > 1e-12, denY > 1e-12 else { return nil }
-        let den = sqrt(denX) * sqrt(denY)
+        let den = sqrt(denX * denY)
         guard den > 1e-9 else { return nil }
         let r = num / den
         guard r.isFinite else { return nil }
@@ -90,7 +89,7 @@ public enum SignalCorrelator: Sendable {
         }
 
         guard denX > 1e-12, denY > 1e-12 else { return nil }
-        let den = sqrt(denX) * sqrt(denY)
+        let den = sqrt(denX * denY)
         guard den > 1e-9 else { return nil }
         let r = num / den
         guard r.isFinite else { return nil }
@@ -167,8 +166,6 @@ public enum SignalCorrelator: Sendable {
         minimumSamples: Int = 6
     ) -> [SliceCorrelation] {
         guard !byteRows.isEmpty, !references.isEmpty else { return [] }
-        let nBytes = byteRows[0].count
-        guard nBytes > 0, byteRows.allSatisfy({ $0.count >= nBytes }) else { return [] }
 
         var minCount = byteRows.count
         for (_, refValues) in references {
@@ -177,6 +174,12 @@ public enum SignalCorrelator: Sendable {
         guard minCount >= minimumSamples else { return [] }
 
         let alignedRows = Array(byteRows.suffix(minCount))
+        guard let nBytes = alignedRows.map(\.count).min(), nBytes > 0 else { return [] }
+
+        let alignedRefs: [(name: String, values: [Double])] = references.map { (key, value) in
+            (name: key, values: Array(value.suffix(minCount)))
+        }
+
         var slices: [String: [Double]] = [:]
 
         // Génération des tranches 8-bit (A, B, C... sans collision au-delà de 26 octets)
@@ -203,8 +206,7 @@ public enum SignalCorrelator: Sendable {
             #endif
             let sRange = sMax - sMin
 
-            for (refName, refValues) in references {
-                let alignedRef = Array(refValues.suffix(minCount))
+            for (refName, alignedRef) in alignedRefs {
                 if let r = pearsonCorrelation(x: sVals, y: alignedRef) {
                     let classification = classify(range: sRange, r: r, refName: refName)
                     results.append(

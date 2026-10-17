@@ -185,14 +185,16 @@ public enum UnifiedProfileConverter: Sendable {
     }
 
     private static func parseFormula(_ formula: String) -> (startBit: Int, lengthBits: Int, format: UnifiedDataFormat) {
-        let cleaned = formula.replacing( " ", with: "")
+        let cleaned = formula.replacing(" ", with: "")
         let letters = cleaned.filter { $0 >= "A" && $0 <= "Z" }
-        guard let firstLetter = letters.first else {
+        guard let firstLetter = letters.first,
+              let firstAscii = firstLetter.asciiValue else {
             return (0, 8, .identical)
         }
 
-        let firstIndex = Int(firstLetter.asciiValue! - Character("A").asciiValue!)
-        let isTwoBytes = letters.count >= 2 && letters.contains(Character(UnicodeScalar(firstLetter.asciiValue! + 1)))
+        let letterA = UInt8(ascii: "A")
+        let firstIndex = Int(firstAscii - letterA)
+        let isTwoBytes = letters.count >= 2 && letters.contains(Character(UnicodeScalar(firstAscii + 1)))
 
         let startBit = firstIndex * 8
         let lengthBits = isTwoBytes ? 16 : 8
@@ -214,23 +216,31 @@ public enum UnifiedProfileConverter: Sendable {
 
     private static func extractMultiplierAndOffset(from formula: String) -> (mult: Double, offset: Double)? {
         let multPattern = #"\*([0-9.]+)"#
+        let divPattern = #"/([0-9.]+)"#
         var mult: Double = 1.0
         var offset: Double = 0.0
 
         if let multRange = formula.range(of: multPattern, options: .regularExpression) {
-            let multStr = String(formula[multRange]).replacing( "*", with: "")
+            let multStr = String(formula[multRange]).replacing("*", with: "")
             if let parsedMult = Double(multStr) {
                 mult = parsedMult
             }
         }
 
+        if let divRange = formula.range(of: divPattern, options: .regularExpression) {
+            let divStr = String(formula[divRange]).replacing("/", with: "")
+            if let parsedDiv = Double(divStr), parsedDiv != 0.0 {
+                mult /= parsedDiv
+            }
+        }
+
         if let plusRange = formula.range(of: #"\+([0-9.]+)"#, options: .regularExpression) {
-            let offsetStr = String(formula[plusRange]).replacing( "+", with: "")
+            let offsetStr = String(formula[plusRange]).replacing("+", with: "")
             if let parsedOffset = Double(offsetStr) {
                 offset = parsedOffset
             }
         } else if let minusRange = formula.range(of: #"-([0-9.]+)"#, options: .regularExpression) {
-            let offsetStr = String(formula[minusRange]).replacing( "-", with: "")
+            let offsetStr = String(formula[minusRange]).replacing("-", with: "")
             if let parsedOffset = Double(offsetStr) {
                 offset = -parsedOffset
             }
@@ -241,13 +251,15 @@ public enum UnifiedProfileConverter: Sendable {
 
     private static func buildFormulaFromParam(_ param: UnifiedParameter) -> String {
         let byteIndex = param.startBit / 8
-        let letterA = Character("A").asciiValue!
-        let letter = String(UnicodeScalar(letterA + UInt8(min(byteIndex, 25))))
+        let safeByteIndex = max(0, min(byteIndex, 25))
+        let letterA = UInt8(ascii: "A")
+        let letter = String(UnicodeScalar(letterA + UInt8(safeByteIndex)))
 
         switch param.dataFormat {
         case .linear(let multiplier, let offset):
             if param.lengthBits == 16 {
-                let nextLetter = String(UnicodeScalar(letterA + UInt8(min(byteIndex + 1, 25))))
+                let nextByteIndex = max(0, min(safeByteIndex + 1, 25))
+                let nextLetter = String(UnicodeScalar(letterA + UInt8(nextByteIndex)))
                 if offset != 0.0 {
                     return "((\(letter)*256+\(nextLetter))*\(multiplier)+\(offset))"
                 } else {
@@ -262,7 +274,8 @@ public enum UnifiedProfileConverter: Sendable {
             }
         case .identical:
             if param.lengthBits == 16 {
-                let nextLetter = String(UnicodeScalar(letterA + UInt8(min(byteIndex + 1, 25))))
+                let nextByteIndex = max(0, min(safeByteIndex + 1, 25))
+                let nextLetter = String(UnicodeScalar(letterA + UInt8(nextByteIndex)))
                 return "(\(letter)*256+\(nextLetter))"
             }
             return letter

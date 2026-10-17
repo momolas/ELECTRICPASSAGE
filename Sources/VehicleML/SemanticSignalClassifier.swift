@@ -63,14 +63,14 @@ public enum SemanticSignalClassifier: Sendable {
 
     /// Classifie une séquence temporelle de valeurs d'un octet ou mot de données
     public static func classify(sliceName: String, values: [Double]) -> SemanticClassificationResult {
-        guard values.count >= 4 else {
+        guard values.count >= 4, values.allSatisfy(\.isFinite) else {
             return SemanticClassificationResult(
                 sliceName: sliceName,
                 category: .unknown,
                 confidence: 0.0,
                 suggestedUnit: "raw",
                 dynamicRange: 0.0,
-                rationale: "Échantillons insuffisants (< 4 points)"
+                rationale: "Échantillons insuffisants (< 4 points) ou valeurs non finies"
             )
         }
 
@@ -82,7 +82,7 @@ public enum SemanticSignalClassifier: Sendable {
         if range == 0.0 {
             let hexStr = (minVal.isFinite && minVal >= 0 && minVal <= Double(UInt64.max))
                 ? String(UInt64(minVal), radix: 16, uppercase: true)
-                : String(format: "%.1f", minVal)
+                : "\((minVal * 10.0).rounded() / 10.0)"
             return SemanticClassificationResult(
                 sliceName: sliceName,
                 category: .constantMarker,
@@ -93,16 +93,21 @@ public enum SemanticSignalClassifier: Sendable {
             )
         }
 
-        // 2. Compteur incrémental (Rolling counter: dérive constante +1)
-        var isCounter = true
+        // 2. Compteur incrémental (Rolling counter: dérive +1 avec tolérance aux doublons d'échantillonnage)
+        let totalSteps = values.count - 1
+        var incrementSteps = 0
+        var duplicateSteps = 0
         for i in 1..<values.count {
             let diff = values[i] - values[i - 1]
-            if diff != 1.0 && !(values[i - 1] > values[i] && (diff == -15.0 || diff == -255.0)) {
-                isCounter = false
-                break
+            if diff == 1.0 || (values[i - 1] > values[i] && (diff == -15.0 || diff == -255.0)) {
+                incrementSteps += 1
+            } else if diff == 0.0 {
+                duplicateSteps += 1
             }
         }
-        if isCounter && range > 0 {
+        if incrementSteps + duplicateSteps == totalSteps &&
+           Double(incrementSteps) / Double(totalSteps) >= 0.80 &&
+           range > 0 {
             return SemanticClassificationResult(
                 sliceName: sliceName,
                 category: .counterOrCRC,
@@ -113,12 +118,30 @@ public enum SemanticSignalClassifier: Sendable {
             )
         }
 
-        // 3. Détection Dérive Thermique Lente
-        var totalAbsDelta = 0.0
-        for i in 1..<values.count {
-            totalAbsDelta += abs(values[i] - values[i - 1])
+        // 3. Détection Angle Volant Direction (signal bipolaire centré autour de zéro)
+        let mean = values.reduce(0.0, +) / Double(values.count)
+        if minVal < -10.0 && maxVal > 10.0 && abs(mean) < range * 0.35 {
+            return SemanticClassificationResult(
+                sliceName: sliceName,
+                category: .steeringAngle,
+                confidence: 0.86,
+                suggestedUnit: "°",
+                dynamicRange: range,
+                rationale: "Oscillation bipolaire autour du point milieu zéro compatible avec un angle de volant"
+            )
         }
-        let avgDelta = totalAbsDelta / Double(values.count - 1)
+
+        // 4. Détection Dérive Thermique Lente
+        var totalAbsDelta = 0.0
+        var isMonotonicNonDecreasing = true
+        for i in 1..<values.count {
+            let step = values[i] - values[i - 1]
+            totalAbsDelta += abs(step)
+            if step < 0.0 {
+                isMonotonicNonDecreasing = false
+            }
+        }
+        let avgDelta = totalAbsDelta / Double(totalSteps)
         if avgDelta < 0.2 && range < 15.0 && minVal > 20.0 {
             return SemanticClassificationResult(
                 sliceName: sliceName,
@@ -130,33 +153,7 @@ public enum SemanticSignalClassifier: Sendable {
             )
         }
 
-        // 4. Détection Contacteur / Pression Frein (Base à zéro avec pics transitoires)
-        let zerosCount = values.filter { $0 == 0.0 }.count
-        let zeroRatio = Double(zerosCount) / Double(values.count)
-        if zeroRatio >= 0.50 && range > 5.0 {
-            return SemanticClassificationResult(
-                sliceName: sliceName,
-                category: .brakePedalOrPressure,
-                confidence: 0.85,
-                suggestedUnit: "bar",
-                dynamicRange: range,
-                rationale: "Signal au repos à 0 avec impulsions positives d'amplitude significative"
-            )
-        }
-
-        // 5. Détection Pédale / Papillon 0-100%
-        if minVal >= 0.0 && maxVal <= 100.0 && range >= 20.0 {
-            return SemanticClassificationResult(
-                sliceName: sliceName,
-                category: .throttleOrPedal,
-                confidence: 0.78,
-                suggestedUnit: "%",
-                dynamicRange: range,
-                rationale: "Plage dynamique normalisée comprise entre 0% et 100%"
-            )
-        }
-
-        // 6. Détection Régime Moteur (RPM 16-bit)
+        // 5. Détection Régime Moteur (RPM 16-bit)
         if minVal >= 500.0 && maxVal <= 9000.0 && range > 100.0 {
             return SemanticClassificationResult(
                 sliceName: sliceName,
@@ -168,8 +165,54 @@ public enum SemanticSignalClassifier: Sendable {
             )
         }
 
-        // 7. Détection Vitesse Véhicule
-        if minVal >= 0.0 && maxVal <= 260.0 && range > 5.0 && avgDelta > 0.05 && avgDelta < 5.0 {
+        let nameLower = sliceName.lowercased()
+        let isSpeedHint = nameLower.contains("speed") || nameLower.contains("vitesse") || nameLower.contains("kmh")
+        let isThrottleHint = nameLower.contains("throttle") || nameLower.contains("pedal") || nameLower.contains("papillon")
+
+        // 6. Détection Contacteur / Pression Frein (Base à zéro avec pics transitoires)
+        let zerosCount = values.filter { $0 == 0.0 }.count
+        let zeroRatio = Double(zerosCount) / Double(values.count)
+        if !isSpeedHint && zeroRatio >= 0.50 && range > 5.0 {
+            return SemanticClassificationResult(
+                sliceName: sliceName,
+                category: .brakePedalOrPressure,
+                confidence: 0.85,
+                suggestedUnit: "bar",
+                dynamicRange: range,
+                rationale: "Signal au repos à 0 avec impulsions positives d'amplitude significative"
+            )
+        }
+
+        // 7. Détection Vitesse Véhicule (plage > 100 km/h, indice sémantique ou rampe d'accélération fluide)
+        if minVal >= 0.0 && maxVal <= 350.0 && range > 5.0 {
+            let isHighSpeedRange = maxVal > 100.0 && avgDelta <= 25.0
+            let isSmoothAcceleration = !isThrottleHint && isMonotonicNonDecreasing && values.count >= 6 && avgDelta <= 8.0
+            if isSpeedHint || isHighSpeedRange || isSmoothAcceleration {
+                return SemanticClassificationResult(
+                    sliceName: sliceName,
+                    category: .vehicleSpeed,
+                    confidence: 0.80,
+                    suggestedUnit: "km/h",
+                    dynamicRange: range,
+                    rationale: "Variation continue sans ruptures violentes, compatible vitesse véhicule"
+                )
+            }
+        }
+
+        // 8. Détection Pédale / Papillon 0-100%
+        if minVal >= 0.0 && maxVal <= 100.0 && range >= 20.0 {
+            return SemanticClassificationResult(
+                sliceName: sliceName,
+                category: .throttleOrPedal,
+                confidence: 0.78,
+                suggestedUnit: "%",
+                dynamicRange: range,
+                rationale: "Plage dynamique normalisée comprise entre 0% et 100%"
+            )
+        }
+
+        // 9. Détection Vitesse Véhicule basse vitesse (plage < 20 km/h)
+        if minVal >= 0.0 && maxVal <= 260.0 && range > 5.0 && avgDelta > 0.05 && avgDelta < 10.0 {
             return SemanticClassificationResult(
                 sliceName: sliceName,
                 category: .vehicleSpeed,

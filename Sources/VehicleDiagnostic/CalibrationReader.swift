@@ -41,16 +41,26 @@ public nonisolated struct ECUCalibrationInfo: Sendable, Equatable, Codable {
 
     /// Indique si une signature de reprogrammation (Stage 1, EGR/DPF off, CVN invalidé) est détectée
     public var isSuspiciousTuningDetected: Bool {
-        let suspiciousMarkers = [
-            "STAGE", "TUNED", "MOD", "EGR", "DPF", "FAP",
-            "POP", "NOREAD", "BFLASH", "AUTOTUNER", "WINOLS"
+        let exactSubstringMarkers = [
+            "STAGE1", "STAGE 1", "STAGE2", "STAGE 2", "STAGE3",
+            "TUNED", "EGR_OFF", "EGROFF", "DPF_OFF", "DPFOFF",
+            "FAP_OFF", "FAPOFF", "POPBANG", "NOREAD", "BFLASH",
+            "AUTOTUNER", "WINOLS"
+        ]
+        let standaloneTokenMarkers: Set<String> = [
+            "STAGE", "MOD", "EGR", "DPF", "FAP"
         ]
 
         let allText = (calibrationIDs + [hardwareNumber, softwareNumber].compactMap { $0 })
             .joined(separator: " ")
             .uppercased()
 
-        if suspiciousMarkers.contains(where: { allText.contains($0) }) {
+        if exactSubstringMarkers.contains(where: { allText.contains($0) }) {
+            return true
+        }
+
+        let tokens = allText.components(separatedBy: CharacterSet.alphanumerics.inverted)
+        if tokens.contains(where: { standaloneTokenMarkers.contains($0) }) {
             return true
         }
 
@@ -102,12 +112,16 @@ public enum CalibrationReader: Sendable {
             throw CancellationError()
         } catch {}
 
-        // 2. Stage B : UDS ISO 14229 Service 0x22 (DID F198 CalID, F188 SW, F191 HW)
+        // 2. Stage B : UDS ISO 14229 Service 0x22 (DID F198 / F182 CalID, F188 SW, F191 HW)
         do {
             try Task.checkCancellation()
             try await interface.setTarget(txID: "7E0", rxID: "7E8")
             let rawCal = try? await interface.sendDiagnosticRequest("22F198", timeout: 1.5)
-            let calID = rawCal.flatMap { parseUDSIdentifier($0, did: "F198") }
+            var calID = rawCal.flatMap { parseUDSIdentifier($0, did: "F198") }
+            if calID == nil {
+                let rawAppCal = try? await interface.sendDiagnosticRequest("22F182", timeout: 1.5)
+                calID = rawAppCal.flatMap { parseUDSIdentifier($0, did: "F182") }
+            }
 
             let rawSW = try? await interface.sendDiagnosticRequest("22F188", timeout: 1.5)
             let swNum = rawSW.flatMap { parseUDSIdentifier($0, did: "F188") }
@@ -118,10 +132,15 @@ public enum CalibrationReader: Sendable {
             let rawCVN = try? await interface.sendDiagnosticRequest("22F199", timeout: 1.5)
             let cvnHex = rawCVN.flatMap { parseUDSHexPayload($0, did: "F199") }
 
-            let cals = [calID, swNum].compactMap { $0 }
-            if !cals.isEmpty || hwNum != nil {
+            var uniqueCals: [String] = []
+            for candidate in [calID, swNum].compactMap({ $0 }) {
+                if !uniqueCals.contains(candidate) {
+                    uniqueCals.append(candidate)
+                }
+            }
+            if !uniqueCals.isEmpty || hwNum != nil {
                 return ECUCalibrationInfo(
-                    calibrationIDs: cals.isEmpty ? [] : [cals[0]],
+                    calibrationIDs: uniqueCals,
                     calibrationVerificationNumbers: cvnHex.map { [$0] } ?? [],
                     hardwareNumber: hwNum,
                     softwareNumber: swNum,

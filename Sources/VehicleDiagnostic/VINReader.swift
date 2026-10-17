@@ -9,10 +9,10 @@ public enum VINReader: Sendable {
     public static func read(interface: VehicleInterface) async throws -> String? {
         try Task.checkCancellation()
 
-        // 1. Stage A: Standard OBD-II Mode 09 PID 02 (Broadcast 0x7DF -> 0x7E8)
+        // 1. Stage A: Standard OBD-II Mode 09 PID 02 (Broadcast 0x7DF)
         do {
             try Task.checkCancellation()
-            try await interface.setTarget(txID: "7DF", rxID: "7E8")
+            try await interface.setTarget(txID: "7DF", rxID: nil)
             let response = try await interface.sendDiagnosticRequest("0902", timeout: 2.0)
             if let vin = parseOBD2VIN(response) {
                 return vin
@@ -51,22 +51,24 @@ public enum VINReader: Sendable {
             if error is CancellationError { throw error }
         }
 
-        // 4. Stage D: Renault Physical UCH / BCM (0x744 / 0x745 -> 0x764 / 0x765) KWP2000
-        do {
-            try Task.checkCancellation()
-            try await interface.setTarget(txID: "744", rxID: "764")
-            _ = try? await openDiagnosticSession(interface: interface)
+        // 4. Stage D: Renault Physical UCH / BCM (0x745 -> 0x765 et 0x744 -> 0x764) KWP2000
+        for (txID, rxID) in [("745", "765"), ("744", "764")] {
+            do {
+                try Task.checkCancellation()
+                try await interface.setTarget(txID: txID, rxID: rxID)
+                _ = try? await openDiagnosticSession(interface: interface)
 
-            for lidCmd in ["2181", "2180", "2182"] {
-                if let response = try? await interface.sendDiagnosticRequest(lidCmd, timeout: 1.5),
-                   let vin = parseKWP2000VIN(response) {
-                    await closeDiagnosticSession(interface: interface)
-                    return vin
+                for lidCmd in ["2181", "2180", "2182"] {
+                    if let response = try? await interface.sendDiagnosticRequest(lidCmd, timeout: 1.5),
+                       let vin = parseKWP2000VIN(response) {
+                        await closeDiagnosticSession(interface: interface)
+                        return vin
+                    }
                 }
+                await closeDiagnosticSession(interface: interface)
+            } catch {
+                if error is CancellationError { throw error }
             }
-            await closeDiagnosticSession(interface: interface)
-        } catch {
-            if error is CancellationError { throw error }
         }
 
         return nil
@@ -101,8 +103,8 @@ public enum VINReader: Sendable {
 
         guard let range = concatenated.range(of: "62F190") else { return nil }
         let start = range.upperBound
-        let dataHex = String(concatenated[start...].prefix(34))
-        guard dataHex.count == 34 else { return nil }
+        let dataHex = String(concatenated[start...])
+        guard dataHex.count >= 34 else { return nil }
 
         let ascii = hexToAscii(dataHex)
         return firstVINMatch(in: ascii)
@@ -121,8 +123,8 @@ public enum VINReader: Sendable {
             return nil
         }
         let start = range.upperBound
-        let dataHex = String(concatenated[start...].prefix(34))
-        guard dataHex.count == 34 else { return nil }
+        let dataHex = String(concatenated[start...])
+        guard dataHex.count >= 34 else { return nil }
 
         let ascii = hexToAscii(dataHex)
         return firstVINMatch(in: ascii)

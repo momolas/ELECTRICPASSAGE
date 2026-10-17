@@ -299,33 +299,26 @@ extension UDSNRC {
 
     /// Analyse une chaîne de réponse hexadécimale brute et extrait le NRC si présent
     public static func parse(from hexResponse: String) -> UDSNRCResponse? {
-        let clean = hexResponse.uppercased()
-            .replacing(" ", with: "")
-            .replacing("\n", with: "")
-            .replacing("\r", with: "")
-            .replacing(">", with: "")
-        
-        // Format standard UDS/KWP: "7F [SID] [NRC]" ex: "7F1022" ou "7F3083" ou avec headers "7E8037F2231"
-        guard let nrcIndex = clean.range(of: "7F") else {
+        let stripped = HexParsing.stripISOTPFraming(hexResponse)
+        guard !stripped.isEmpty else { return nil }
+
+        let hexToParse: String
+        if stripped.count >= 9 && stripped.count % 2 == 1 && stripped.hasPrefix("7") {
+            hexToParse = String(stripped.dropFirst(3))
+        } else {
+            hexToParse = stripped
+        }
+
+        guard let bytes = HexParsing.bytes(hexToParse), bytes.count >= 3 else {
             return nil
         }
-        
-        let remaining = String(clean[nrcIndex.lowerBound...])
-        guard remaining.count >= 6 else { return nil }
-        
-        let sidStart = remaining.index(remaining.startIndex, offsetBy: 2)
-        let sidEnd = remaining.index(remaining.startIndex, offsetBy: 4)
-        let nrcStart = sidEnd
-        let nrcEnd = remaining.index(remaining.startIndex, offsetBy: 6)
-        
-        let sidHex = String(remaining[sidStart..<sidEnd])
-        let nrcHex = String(remaining[nrcStart..<nrcEnd])
-        
-        guard let sidByte = UInt8(sidHex, radix: 16),
-              let nrcByte = UInt8(nrcHex, radix: 16) else {
-            return nil
+
+        if bytes[0] == 0x7F {
+            return UDSNRCResponse(requestedServiceID: bytes[1], rawHexByte: bytes[2])
+        } else if bytes.count >= 4 && bytes[0] == 0x03 && bytes[1] == 0x7F {
+            return UDSNRCResponse(requestedServiceID: bytes[2], rawHexByte: bytes[3])
         }
-        
-        return UDSNRCResponse(requestedServiceID: sidByte, rawHexByte: nrcByte)
+
+        return nil
     }
 }

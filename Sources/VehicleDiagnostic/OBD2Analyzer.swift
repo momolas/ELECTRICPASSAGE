@@ -152,39 +152,9 @@ public final class OBD2Analyzer: Sendable {
         0xD1: "Cruise Control Target Speed"
     ]
 
-    public static let nrcDescriptions: [UInt8: String] = [
-        0x10: "General reject",
-        0x11: "Service not supported",
-        0x12: "Sub-function not supported / Invalid format",
-        0x13: "Incorrect message length or invalid format (UDS)",
-        0x14: "Response too long",
-        0x21: "Busy repeat request",
-        0x22: "Conditions not correct or request sequence error",
-        0x23: "Routine not complete (KWP2000)",
-        0x24: "Request sequence error",
-        0x25: "No response from sub-bus component",
-        0x26: "Failure prevents execution of requested action",
-        0x31: "Request out of range",
-        0x33: "Security access denied",
-        0x35: "Invalid key",
-        0x36: "Exceeded number of attempts",
-        0x37: "Required time delay not expired",
-        0x40: "Download not accepted (KWP2000)",
-        0x41: "Improper download type (KWP2000)",
-        0x42: "Can't download to specified address (KWP2000)",
-        0x43: "Can't download number of bytes requested (KWP2000)",
-        0x50: "Upload not accepted (KWP2000)",
-        0x51: "Improper upload type (KWP2000)",
-        0x52: "Can't upload from specified address (KWP2000)",
-        0x53: "Can't upload number of bytes requested (KWP2000)",
-        0x70: "Upload/download not accepted (UDS)",
-        0x71: "Transfer data suspended",
-        0x72: "General programming failure",
-        0x73: "Wrong block sequence counter",
-        0x78: "Request correctly received - response pending",
-        0x7E: "Sub-function not supported in active session",
-        0x7F: "Service not supported in active session"
-    ]
+    public static let nrcDescriptions: [UInt8: String] = Dictionary(
+        uniqueKeysWithValues: UDSNRC.allCases.map { ($0.rawValue, $0.title) }
+    )
 
     // MARK: - Analyseurs et Formateurs Statiques
 
@@ -325,7 +295,8 @@ public final class OBD2Analyzer: Sendable {
                 let pidHex = String(format: "%02X", reqBytes[1])
                 // Si la trame est du texte (ex: Mode 09 PID 02 -> VIN)
                 if reqMode == 0x09 && reqBytes[1] == 0x02 {
-                    let payload = Array(respBytes.dropFirst(2))
+                    let dropCount = (respBytes.count > 3 && respBytes[2] <= 0x05) ? 3 : 2
+                    let payload = Array(respBytes.dropFirst(dropCount))
                     if let text = asciiDecode(HexParsing.hex(payload)) {
                         return "VIN: \(text)"
                     }

@@ -29,6 +29,7 @@ public actor ISOTPReassembler {
     }
 
     private func purgeStaleStates() {
+        guard !states.isEmpty else { return }
         let now = ContinuousClock.Instant.now
         states = states.filter { _, state in
             now.duration(to: state.lastActivity) > .seconds(-1.5)
@@ -61,7 +62,7 @@ public actor ISOTPReassembler {
                 payload = frame[1...length]
             } else {
                 // ISO 15765-2:2016 CAN-FD Single Frame (8 à 62 octets)
-                guard frame.count >= 2 else {
+                guard frame.count > 8 else {
                     return .error("Trame CAN-FD Single Frame incomplète")
                 }
                 length = Int(frame[1])
@@ -81,6 +82,7 @@ public actor ISOTPReassembler {
             guard frame.count >= 2 else {
                 return .error("Trame First Frame incomplète")
             }
+            let maxISOTPPayload = 65536
             let rawLength = Int((UInt16(frame[0] & 0x0F) << 8) | UInt16(frame[1]))
             let length: Int
             let payload: Data.SubSequence
@@ -92,22 +94,28 @@ public actor ISOTPReassembler {
                 }
                 let len32 = (UInt32(frame[2]) << 24) | (UInt32(frame[3]) << 16) | (UInt32(frame[4]) << 8) | UInt32(frame[5])
                 length = Int(len32)
-                guard length > 4095 else {
-                    return .error("Longueur CAN-FD First Frame 32-bit invalide (\(length))")
+                guard length > 4095 && length <= maxISOTPPayload else {
+                    return .error("Invalid or oversized First Frame length: \(length)")
                 }
                 payload = frame[6...]
             } else {
                 // Classic CAN First Frame (DL <= 4095)
+                guard frame.count >= 8 else {
+                    return .error("Trame First Frame incomplète")
+                }
                 length = rawLength
-                guard length > 7 else {
-                    return .error("Longueur First Frame invalide (\(length))")
+                guard length > 7 && length <= maxISOTPPayload else {
+                    return .error("Invalid or oversized First Frame length: \(length)")
                 }
                 payload = frame[2...]
             }
 
+            var initialBuffer = Data()
+            initialBuffer.reserveCapacity(min(length, 4096))
+            initialBuffer.append(payload)
             states[address] = ReassemblyState(
                 totalLength: length,
-                buffer: Data(payload),
+                buffer: initialBuffer,
                 nextSequence: 1
             )
             return .needsFlowControl

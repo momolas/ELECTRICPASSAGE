@@ -1432,5 +1432,143 @@ struct VehicleKitTests {
         #expect(info.primaryCVN == "A3B8C912")
         #expect(info.protocolSource == "OBD2-Mode09")
         #expect(info.isSuspiciousTuningDetected == false)
+
+        // OEM "MODUS" or "MODULE" must not trigger false positive on "MOD"
+        let modusOEM = ECUCalibrationInfo(
+            calibrationIDs: ["RENAULT_MODUS_15DCI"],
+            calibrationVerificationNumbers: ["A3B8C912"],
+            hardwareNumber: "MODULE_DELPHI",
+            softwareNumber: "8200592611",
+            protocolSource: "KWP2000-2180"
+        )
+        #expect(modusOEM.isSuspiciousTuningDetected == false)
+    }
+
+    // MARK: - P0-P3 Engine Audit Hardening Suite
+
+    @Test("BusCoordinator Waiter Cancellation Without Continuation Leak or Premature Release")
+    @MainActor
+    func testBusCoordinatorWaiterCancellationSafety() async throws {
+        let coordinator = BusCoordinator()
+
+        // Owner holds the bus
+        let ownerAcquired = await coordinator.acquire(priority: .criticalExclusive, name: "Owner")
+        #expect(ownerAcquired == true)
+        #expect(coordinator.isBusy == true)
+
+        // Spawn a waiter that gets cancelled while waiting in queue
+        let cancelledTask = Task { @MainActor in
+            try await coordinator.withExclusiveAccess(priority: .interactive, name: "CancelledWaiter") {
+                Issue.record("Cancelled waiter should not execute operation")
+            }
+        }
+
+        try await Task.sleep(for: .milliseconds(20))
+        cancelledTask.cancel()
+
+        do {
+            try await cancelledTask.value
+            Issue.record("Expected CancellationError")
+        } catch is CancellationError {
+            // Expected
+        }
+
+        // Bus MUST still be held by Owner (cancelled waiter must not have called release())
+        #expect(coordinator.isBusy == true)
+        #expect(coordinator.activeSessionName == "Owner")
+
+        coordinator.release()
+        #expect(coordinator.isBusy == false)
+    }
+
+    @Test("FormulaEvaluator Short-Circuiting, Scientific Notation & Bitwise AND/OR")
+    func testFormulaEvaluatorShortCircuitAndScientificNotation() {
+        let evaluator = FormulaEvaluator()
+
+        // 1. Short-circuit && prevents division by zero when B == 0
+        let safeAnd = evaluator.evaluate(formula: "B != 0 && (A / B) > 2", bytes: [0x10, 0x00])
+        #expect(safeAnd == 0.0)
+
+        // 2. Short-circuit || skips invalid RHS when LHS is true
+        let safeOr = evaluator.evaluate(formula: "A > 0 || (1 / 0) > 0", bytes: [0x05])
+        #expect(safeOr == 1.0)
+
+        // 3. Scientific notation (1e-2, 2.5E2)
+        let sci1 = evaluator.evaluate(formula: "A * 1e-2", bytes: [100])
+        #expect(sci1 == 1.0)
+        let sci2 = evaluator.evaluate(formula: "A * 2.5E2", bytes: [2])
+        #expect(sci2 == 500.0)
+    }
+
+    @Test("UDSNRC False-Positive Immunity on 0x7F Data Payload Bytes & Unaligned Nibbles")
+    func testUDSNRCByteAlignmentAndPayloadImmunity() {
+        // 1. Positive UDS response containing "7F" across nibbles (07 F1) or as data byte
+        #expect(UDSNRC.parse(from: "62 F1 90 07 F1 22 33") == nil)
+        #expect(UDSNRC.parse(from: "62 01 05 7F 10 22") == nil)
+
+        // 2. Genuine UDS Negative Response (7F 22 31) and PCI-prefixed (03 7F 22 31)
+        let nrc1 = UDSNRC.parse(from: "7F 22 31")
+        #expect(nrc1?.requestedServiceID == 0x22)
+        #expect(nrc1?.nrc == .requestOutOfRange)
+
+        let nrc2 = UDSNRC.parse(from: "03 7F 27 35")
+        #expect(nrc2?.requestedServiceID == 0x27)
+        #expect(nrc2?.nrc == .invalidKey)
+    }
+
+    @Test("J1939 Extended Data Page (EDP) & 0xFFFF Not-Available Sentinel Filtering")
+    func testJ1939EDPAndSentinelFiltering() {
+        // 1. Sentinel 0xFF / 0xFFFF in EEC1 (0x0CF00400) must be filtered out
+        let sentinelPayload = Data(repeating: 0xFF, count: 8)
+        let emptySignals = J1939Decoder.decode(pgn: 0xF004, data: sentinelPayload)
+        #expect(emptySignals.isEmpty)
+
+        // 2. EDP bit (bit 25) included in PGN calculation
+        let edpHeader = J1939Header(canID: 0x0AF00400) // EDP = 1, DP = 0
+        #expect(edpHeader.extendedDataPage == 1)
+        #expect(edpHeader.pgn == 0x2F004)
+    }
+
+    @Test("SignalCorrelator High-Offset Pearson Stability & Biquad Cold-Start Pre-Warming")
+    func testAnalyticsNumericalImprovements() {
+        // 1. High DC offset (150,000 + small delta) Pearson correlation must not suffer catastrophic cancellation
+        let x = [150_000.01, 150_000.02, 150_000.03, 150_000.04, 150_000.05]
+        let y = [150_000.02, 150_000.04, 150_000.06, 150_000.08, 150_000.10]
+        let r = SignalCorrelator.pearsonCorrelation(x: x, y: y)
+        #expect(abs((r ?? 0.0) - 1.0) < 1e-6)
+
+        // 2. Biquad filter pre-warms on first finite sample (no cold-start jump from 0.0)
+        let biquad = SignalFilter.Biquad.lowPass(cutoffFrequency: 2.0, sampleRate: 10.0)
+        var state = SignalFilter.Biquad.State()
+        let firstOut = biquad.filter(sample: 850.0, state: &state)
+        #expect(abs(firstOut - 850.0) < 1e-6)
+    }
+
+    @Test("OdometerFraudAuditor Sentinel Filtering & BatteryHealthEstimator Thermal/SoC Guards")
+    func testVehicleMLHardening() {
+        // 1. Sentinel 655350 km on ABS must be ignored rather than triggering confirmedTampering
+        let sentinelInput = OdometerFraudAuditor.InputData(
+            clusterMileageKm: 120_000,
+            engineECUMileageKm: 120_000,
+            absMileageKm: 655_350,
+            freezeFrameMileages: [115_000, 655_350]
+        )
+        let fraudReport = OdometerFraudAuditor.audit(input: sentinelInput)
+        #expect(fraudReport.riskLevel == .genuine)
+        #expect(fraudReport.estimatedRealMileageKm == 120_000)
+
+        // 2. Discharged battery (11.7V resting) with small crank sag must not be rated .excellent
+        let dischargedBattery = BatteryHealthEstimator.estimate(
+            restingVoltage: 11.7,
+            minimumCrankingVoltage: 10.6,
+            temperatureCelsius: 20.0
+        )
+        #expect(dischargedBattery.status != .excellent)
+
+        // 3. Steering angle bipolar zero-crossing signal classification
+        let steeringSamples = [-45.0, -30.0, -10.0, 0.0, 15.0, 35.0, 50.0, 20.0, -25.0]
+        let classified = SemanticSignalClassifier.classify(sliceName: "B0_B1", values: steeringSamples)
+        #expect(classified.category == .steeringAngle)
     }
 }
+
