@@ -397,7 +397,9 @@ public actor KWP2000Client {
         }
     }
 
-    public func stop() {
-        stopTesterPresent()
+    nonisolated public func stop() {
+        Task {
+            await stopTesterPresent()
+        }
     }
 }

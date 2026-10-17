@@ -556,6 +556,12 @@ public final class OBD2Analyzer: Sendable {
         return CANProtocolDetector.detect(canID: canID, payload: data)
     }
 
+    /// Décode les signaux physiques d'une trame SAE J1939 (29 bits) à partir de son PGN
+    public static func decodeJ1939Signals(canID: UInt32, data: Data) -> [J1939Signal] {
+        let header = J1939Header(canID: canID)
+        return J1939Decoder.decode(pgn: header.pgn, data: data)
+    }
+
     // MARK: - SAE J1979 Mode 06 (On-Board Monitoring)
 
     public static let mode06MonitorNames: [UInt8: String] = [
