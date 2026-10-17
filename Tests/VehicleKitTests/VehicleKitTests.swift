@@ -1570,5 +1570,56 @@ struct VehicleKitTests {
         let classified = SemanticSignalClassifier.classify(sliceName: "B0_B1", values: steeringSamples)
         #expect(classified.category == .steeringAngle)
     }
+
+    @Test("White Panda STM32F4 16-Byte bxCAN Framing, TX Echo Filtering & Health Telemetry")
+    func testWhitePandaBxCAN16AndHealthTelemetry() throws {
+        #expect(PandaSafetyModel.allOutput.rawValue == 17)
+        #expect(PandaHardwareType.whitePanda.rawValue == 1)
+
+        // 1. Standard 11-bit bxCAN16 packing & unpacking (0x7E0 -> 0x7E8)
+        let payload = Data([0x02, 0x10, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00])
+        let packed16 = PandaDriver.packBxCAN16(address: 0x7E0, data: payload, bus: 0)
+        #expect(packed16.count == 16)
+
+        // Simulate USB EP1 IN / UDP 1338 stream with TX echo (bus 0x80) + RX frame (0x7E8 on bus 0)
+        var txEcho = packed16
+        txEcho[4] |= (0x80 << 4) & 0xFF
+        txEcho[5] |= UInt8((0x80 >> 4) & 0xFF)
+        let rxFrame16 = PandaDriver.packBxCAN16(address: 0x7E8, data: Data([0x02, 0x50, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00]), bus: 0)
+
+        let combinedStream = txEcho + rxFrame16
+        let rxOnly = PandaDriver.unpackBxCAN16(data: combinedStream, includeTxEcho: false)
+        #expect(rxOnly.count == 1)
+        #expect(rxOnly.first?.address == 0x7E8)
+        #expect(rxOnly.first?.bus == 0)
+        #expect(rxOnly.first?.isTxReceipt == false)
+
+        let withEcho = PandaDriver.unpackBxCAN16(data: combinedStream, includeTxEcho: true)
+        #expect(withEcho.count == 2)
+        #expect(withEcho.first?.isTxReceipt == true)
+
+        // 2. Real 41-byte health_t buffer captured from White Panda v1.7.5-DEV-unknown-DEBUG
+        let rawHealth = Data([
+            0x91, 0x00, 0x00, 0x00, // uptime = 145s
+            0x8E, 0x12, 0x00, 0x00, // voltage = 4750 mV
+            0xFE, 0x0F, 0x00, 0x00, // current = 4094
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, // faults = 0
+            0x00, 0x00, 0x01, 0x00, // controls_allowed = 1
+            0x00, 0x01, 0x11, 0x00, // usb_power_mode = 1, safety_model = 0x11 (17), fault_status = 0
+            0x00
+        ])
+        let health = try #require(PandaHealth(data: rawHealth))
+        #expect(health.uptime == 145)
+        #expect(health.voltageMV == 4750)
+        #expect(health.faults == 0)
+        #expect(health.controlsAllowed == true)
+        #expect(health.safetyModel == 17)
+        #expect(health.faultStatus == 0)
+    }
 }
+
 
