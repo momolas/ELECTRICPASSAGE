@@ -346,12 +346,31 @@ public actor KWP2000Client {
         return clean
     }
 
+    /// Lecture directe d'une plage mémoire par adresse (Service 23 - ReadMemoryByAddress KWP2000)
+    public func readMemoryByAddress(memoryAddress: UInt32, memorySize: UInt8) async throws -> Data {
+        let addrHex = String(format: "%06X", memoryAddress & 0xFFFFFF)
+        let sizeHex = String(format: "%02X", memorySize)
+        let command = "23" + addrHex + sizeHex
+        let response = try await interface.sendDiagnosticRequest(command, timeout: 3.0)
+        let clean = normalizeResponse(response, service: 0x23)
+
+        if clean.hasPrefix("7F23") {
+            let nrc = UInt8(clean.dropFirst(4).prefix(2), radix: 16) ?? 0
+            throw KWP2000Error.negativeResponse(service: 0x23, nrc: nrc)
+        }
+        guard clean.hasPrefix("63") else {
+            throw KWP2000Error.unexpectedResponse(expected: "63", received: response)
+        }
+        let payloadHex = String(clean.dropFirst(2))
+        return Data(HexParsing.bytes(payloadHex) ?? [])
+    }
+
     /// Transfert d'un bloc de données (Service 36 - Transfer Data)
     public func transferData(blockSequenceCounter: UInt8, payload: String = "") async throws -> String {
         let blockHex = String(format: "%02X", blockSequenceCounter)
         let cleanPayload = payload.replacing(" ", with: "").uppercased()
         let command = "36" + blockHex + cleanPayload
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 2.5)
+        let response = try await interface.sendDiagnosticRequest(command, timeout: 4.0)
         let clean = normalizeResponse(response, service: 0x36)
 
         if clean.hasPrefix("7F36") {
@@ -362,6 +381,22 @@ public actor KWP2000Client {
             throw KWP2000Error.unexpectedResponse(expected: "76", received: response)
         }
         return clean
+    }
+
+    /// Transfert d'un bloc binaire typé `Data` (Service 36 - Transfer Data) avec extraction automatique des octets reçus.
+    @discardableResult
+    public func transferDataBytes(blockSequenceCounter: UInt8, payload: Data = Data()) async throws -> Data {
+        let payloadHex = HexParsing.hex([UInt8](payload))
+        let clean = try await transferData(blockSequenceCounter: blockSequenceCounter, payload: payloadHex)
+        let afterSID = String(clean.dropFirst(2))
+        let bscHex = String(format: "%02X", blockSequenceCounter)
+        let dataHex: String
+        if afterSID.hasPrefix(bscHex) {
+            dataHex = String(afterSID.dropFirst(2))
+        } else {
+            dataHex = afterSID
+        }
+        return Data(HexParsing.bytes(dataHex) ?? [])
     }
 
     /// Sortie du mode transfert (Service 37 - Request Transfer Exit)

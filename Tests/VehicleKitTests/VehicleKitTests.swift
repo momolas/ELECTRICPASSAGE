@@ -1620,6 +1620,89 @@ struct VehicleKitTests {
         #expect(health.safetyModel == 17)
         #expect(health.faultStatus == 0)
     }
+
+    @Test("ECU Flash Validator, Binary Diff, Checksum CRC32 & UDS/KWP2000 Memory Transfer")
+    func testECUFlashValidatorAndMemoryTransfer() async throws {
+        let calInfo = ECUCalibrationInfo(
+            calibrationIDs: ["8200399038_S3000"],
+            calibrationVerificationNumbers: ["A3B8C912"],
+            hardwareNumber: "HW-8200298457",
+            softwareNumber: "SW-00B2-V0430",
+            protocolSource: "KWP2000-2180"
+        )
+
+        // 1. Build synthetic 64 KB stock calibration & inspect metadata
+        let stockBin = ECUFlashValidator.buildSyntheticStockCalibration(calibration: calInfo, size: 65536)
+        #expect(stockBin.count == 65536)
+
+        let stockMeta = ECUFlashValidator.inspect(data: stockBin, fileName: "scenic2_stock.bin")
+        #expect(stockMeta.isValidSize == true)
+        #expect(stockMeta.isAllBlankOrZero == false)
+        #expect(stockMeta.detectedASCIIIdentifiers.contains("HW-8200298457"))
+        #expect(stockMeta.detectedASCIIIdentifiers.contains("SW-00B2-V0430"))
+        #expect(stockMeta.detectedASCIIIdentifiers.contains("8200399038_S3000"))
+
+        // 2. Build simulated Stage 1 calibration & compare sectors
+        let stage1Bin = ECUFlashValidator.buildSimulatedStage1Calibration(from: stockBin)
+        #expect(stage1Bin.count == 65536)
+        #expect(ECUFlashValidator.crc32(stage1Bin) != ECUFlashValidator.crc32(stockBin))
+
+        let diff = ECUFlashValidator.compare(
+            original: stockBin,
+            modified: stage1Bin,
+            sectorSize: 4096,
+            ecuCalibration: calInfo
+        )
+        #expect(diff.sizeMatches == true)
+        #expect(diff.hwSwCompatibilityPassed == true)
+        #expect(diff.changedBytesCount > 0)
+        #expect(!diff.modifiedSectors.isEmpty)
+        #expect(diff.modifiedSectors.count < diff.totalSectors)
+
+        // 3. Pre-Flight Safety Gate evaluation
+        let stage1Meta = ECUFlashValidator.inspect(data: stage1Bin, fileName: "scenic2_stage1.bin")
+        let safePreFlight = ECUFlashValidator.evaluatePreFlight(
+            batteryVoltage: 13.4,
+            metadata: stage1Meta,
+            ecuCalibration: calInfo,
+            hasStockBackupInVault: true
+        )
+        #expect(safePreFlight.canProceedWithFlash == true)
+        #expect(safePreFlight.blockingReasons.isEmpty)
+
+        let lowVoltPreFlight = ECUFlashValidator.evaluatePreFlight(
+            batteryVoltage: 11.9,
+            metadata: stage1Meta,
+            ecuCalibration: calInfo,
+            hasStockBackupInVault: false
+        )
+        #expect(lowVoltPreFlight.canProceedWithFlash == false)
+        #expect(lowVoltPreFlight.isBatteryVoltageSafe == false)
+        #expect(lowVoltPreFlight.blockingReasons.count >= 2)
+
+        // 4. UDSClient & KWP2000Client memory transfer services against SimulatorEngine
+        let sim = SimulatorEngine()
+        let uds = UDSClient(interface: sim)
+        defer { Task { await uds.stop() } }
+
+        let readMem = try await uds.readMemoryByAddress(memoryAddress: 0x040000, memorySize: 16)
+        #expect(String(decoding: readMem, as: UTF8.self) == "8200399038_S3000")
+
+        let maxUploadBlock = try await uds.requestUpload(memoryAddress: 0x040000, uncompressedSize: 65536)
+        #expect(maxUploadBlock == 1024)
+
+        let maxDownloadBlock = try await uds.requestDownload(memoryAddress: 0x040000, uncompressedSize: 65536)
+        #expect(maxDownloadBlock == 1024)
+
+        _ = try await uds.eraseMemory(memoryAddress: 0x040000, memorySize: 65536)
+        _ = try await uds.transferData(blockSequenceCounter: 1, payload: Data([0xAA, 0xBB, 0xCC, 0xDD]))
+        _ = try await uds.requestTransferExit()
+        _ = try await uds.checkProgrammingDependencies(checksumHex: stage1Meta.crc32Hex)
+
+        let kwp = KWP2000Client(interface: sim)
+        defer { kwp.stop() }
+        let kwpMem = try await kwp.readMemoryByAddress(memoryAddress: 0x040000, memorySize: 16)
+        #expect(String(decoding: kwpMem, as: UTF8.self) == "8200399038_S3000")
+        _ = try await kwp.transferDataBytes(blockSequenceCounter: 1, payload: Data([0x01, 0x02, 0x03, 0x04]))
+    }
 }
-
-

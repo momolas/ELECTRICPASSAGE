@@ -253,10 +253,28 @@ public actor SimulatorEngine: VehicleInterface {
             return "61" + lid + "0000"
         }
 
-        // 9. Write Local Identifier KWP2000 (3B XX)
+        // 9. Write Local Identifier KWP2000 (3B XX) & Write Data By Identifier UDS (2E XXXX)
         if clean.hasPrefix("3B") {
             let lid = String(clean.dropFirst(2).prefix(2))
             return "7B" + lid
+        }
+        if clean.hasPrefix("2E") {
+            let did = String(clean.dropFirst(2).prefix(4))
+            return "6E" + did
+        }
+
+        // 9b. Read Memory By Address (23) / Communication Control (28) / Control DTC Setting (85)
+        if clean.hasPrefix("23") {
+            // Retourne un bloc de mémoire contenant "8200399038_S3000" en ASCII hexadécimal
+            return "63 38 32 30 30 33 39 39 30 33 38 5F 53 33 30 30 30"
+        }
+        if clean.hasPrefix("28") {
+            let subFn = String(clean.dropFirst(2).prefix(2))
+            return "68" + (subFn.isEmpty ? "00" : subFn)
+        }
+        if clean.hasPrefix("85") {
+            let subFn = String(clean.dropFirst(2).prefix(2))
+            return "C5" + (subFn.isEmpty ? "01" : subFn)
         }
 
         // 10. Routine Control / Actuators (30 / 31) & Download/Upload (34 / 35 / 36 / 37)
@@ -270,13 +288,14 @@ public actor SimulatorEngine: VehicleInterface {
             return "7101"
         }
         if clean.hasPrefix("34") {
-            return "74 20"
+            return "74 20 04 00"
         }
         if clean.hasPrefix("35") {
-            return "75 20"
+            return "75 20 04 00"
         }
         if clean.hasPrefix("36") {
-            return "76"
+            let bsc = String(clean.dropFirst(2).prefix(2))
+            return "76 " + (bsc.isEmpty ? "01" : bsc)
         }
         if clean.hasPrefix("37") {
             return "77"

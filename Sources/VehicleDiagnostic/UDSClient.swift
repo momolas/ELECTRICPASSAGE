@@ -211,9 +211,138 @@ public actor UDSClient {
     public func startRoutine(routineType: UInt8 = 0x01, routineId: UInt16, optionHex: String = "") async throws -> String {
         let cleanOption = optionHex.replacing(" ", with: "")
         let hexCmd = String(format: "31%02X%04X%@", routineType, routineId, cleanOption)
-        let response = try await sendRaw(hexCmd)
+        let response = try await sendRaw(hexCmd, timeout: 6.0)
         try validatePositiveResponse(response, expectedSID: 0x31)
         return response
+    }
+
+    /// Effacement d'une plage mémoire Flash via RoutineControl (0x31 01 FF00).
+    @discardableResult
+    public func eraseMemory(memoryAddress: UInt32, memorySize: UInt32, addressAndLengthFormatIdentifier: UInt8 = 0x44) async throws -> String {
+        let options = String(format: "%02X%08X%08X", addressAndLengthFormatIdentifier, memoryAddress, memorySize)
+        return try await startRoutine(routineType: 0x01, routineId: 0xFF00, optionHex: options)
+    }
+
+    /// Vérification d'intégrité et du Checksum post-programmation (0x31 01 FF01 / 0202).
+    @discardableResult
+    public func checkProgrammingDependencies(routineId: UInt16 = 0xFF01, checksumHex: String = "") async throws -> String {
+        return try await startRoutine(routineType: 0x01, routineId: routineId, optionHex: checksumHex)
+    }
+
+    // MARK: - ReadMemoryByAddress (0x23) & Memory Upload / Download (0x34 / 0x35 / 0x36 / 0x37)
+
+    /// Lecture directe d'une zone mémoire par adresse (Service 0x23).
+    /// Par défaut `addressAndLengthFormatIdentifier = 0x24` (adresse 32 bits, longueur 16 bits).
+    public func readMemoryByAddress(
+        memoryAddress: UInt32,
+        memorySize: UInt16,
+        addressAndLengthFormatIdentifier: UInt8 = 0x24
+    ) async throws -> Data {
+        let addrBytes = Int(addressAndLengthFormatIdentifier & 0x0F)
+        let sizeBytes = Int((addressAndLengthFormatIdentifier >> 4) & 0x0F)
+        let addrHex: String
+        switch addrBytes {
+        case 3: addrHex = String(format: "%06X", memoryAddress & 0xFFFFFF)
+        default: addrHex = String(format: "%08X", memoryAddress)
+        }
+        let sizeHex: String
+        switch sizeBytes {
+        case 1: sizeHex = String(format: "%02X", memorySize & 0xFF)
+        default: sizeHex = String(format: "%04X", memorySize)
+        }
+        let hexCmd = String(format: "23%02X%@%@", addressAndLengthFormatIdentifier, addrHex, sizeHex)
+        let response = try await sendRaw(hexCmd, timeout: 4.0)
+        try validatePositiveResponse(response, expectedSID: 0x23)
+
+        let payloadHex = String(response.dropFirst(2))
+        return Data(HexParsing.bytes(payloadHex) ?? [])
+    }
+
+    /// Requête d'autorisation d'écriture en mémoire Flash (Service 0x34 - RequestDownload).
+    /// Retourne la taille maximale de bloc (`maxNumberOfBlockLength`) négociée avec l'ECU.
+    public func requestDownload(
+        memoryAddress: UInt32,
+        uncompressedSize: UInt32,
+        dataFormatIdentifier: UInt8 = 0x00,
+        addressAndLengthFormatIdentifier: UInt8 = 0x44
+    ) async throws -> Int {
+        let hexCmd = String(
+            format: "34%02X%02X%08X%08X",
+            dataFormatIdentifier,
+            addressAndLengthFormatIdentifier,
+            memoryAddress,
+            uncompressedSize
+        )
+        let response = try await sendRaw(hexCmd, timeout: 4.0)
+        try validatePositiveResponse(response, expectedSID: 0x34)
+        return Self.parseMaxBlockLength(from: response, defaultLength: 1024)
+    }
+
+    /// Requête d'extraction / lecture de mémoire Flash (Service 0x35 - RequestUpload).
+    /// Retourne la taille maximale de bloc (`maxNumberOfBlockLength`) négociée avec l'ECU.
+    public func requestUpload(
+        memoryAddress: UInt32,
+        uncompressedSize: UInt32,
+        dataFormatIdentifier: UInt8 = 0x00,
+        addressAndLengthFormatIdentifier: UInt8 = 0x44
+    ) async throws -> Int {
+        let hexCmd = String(
+            format: "35%02X%02X%08X%08X",
+            dataFormatIdentifier,
+            addressAndLengthFormatIdentifier,
+            memoryAddress,
+            uncompressedSize
+        )
+        let response = try await sendRaw(hexCmd, timeout: 4.0)
+        try validatePositiveResponse(response, expectedSID: 0x35)
+        return Self.parseMaxBlockLength(from: response, defaultLength: 1024)
+    }
+
+    /// Transfert d'un bloc de données en lecture ou écriture (Service 0x36 - TransferData).
+    @discardableResult
+    public func transferData(
+        blockSequenceCounter: UInt8,
+        payload: Data = Data()
+    ) async throws -> Data {
+        let payloadHex = HexParsing.hex([UInt8](payload))
+        let hexCmd = String(format: "36%02X%@", blockSequenceCounter, payloadHex)
+        let response = try await sendRaw(hexCmd, timeout: 5.0)
+        try validatePositiveResponse(response, expectedSID: 0x36)
+
+        // Réponse 76 [BSC] [Données optionnelles] ou 76 [Données]
+        let afterSID = String(response.dropFirst(2))
+        let bscHex = String(format: "%02X", blockSequenceCounter)
+        let dataHex: String
+        if afterSID.hasPrefix(bscHex) {
+            dataHex = String(afterSID.dropFirst(2))
+        } else {
+            dataHex = afterSID
+        }
+        return Data(HexParsing.bytes(dataHex) ?? [])
+    }
+
+    /// Sortie du mode de transfert de blocs (Service 0x37 - RequestTransferExit).
+    @discardableResult
+    public func requestTransferExit(parameterRecordHex: String = "") async throws -> String {
+        let cleanParam = parameterRecordHex.replacing(" ", with: "").uppercased()
+        let hexCmd = "37" + cleanParam
+        let response = try await sendRaw(hexCmd, timeout: 3.0)
+        try validatePositiveResponse(response, expectedSID: 0x37)
+        return response
+    }
+
+    private static func parseMaxBlockLength(from responseHex: String, defaultLength: Int) -> Int {
+        guard let bytes = HexParsing.bytes(responseHex), bytes.count >= 3 else {
+            return defaultLength
+        }
+        let lfid = Int((bytes[1] >> 4) & 0x0F)
+        let lengthCount = lfid > 0 ? min(lfid, bytes.count - 2) : (bytes.count - 2)
+        guard lengthCount > 0 else { return defaultLength }
+        var value = 0
+        for i in 0..<lengthCount {
+            value = (value << 8) | Int(bytes[2 + i])
+        }
+        return value > 2 ? value : defaultLength
     }
 
     // MARK: - ControlDTCSetting (0x85)
@@ -245,9 +374,9 @@ public actor UDSClient {
 
     // MARK: - Raw Transfer Helpers
 
-    private func sendRaw(_ hex: String) async throws -> String {
+    private func sendRaw(_ hex: String, timeout: TimeInterval = 2.0) async throws -> String {
         do {
-            let res = try await interface.sendDiagnosticRequest(hex, timeout: 2.0)
+            let res = try await interface.sendDiagnosticRequest(hex, timeout: timeout)
             var clean = res
                 .replacing(" ", with: "")
                 .replacing("\n", with: "")
