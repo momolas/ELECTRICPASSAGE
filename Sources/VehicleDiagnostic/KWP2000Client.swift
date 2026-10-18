@@ -94,9 +94,10 @@ public actor KWP2000Client {
 
     /// Démarre une session de diagnostic KWP2000 (Service 10)
     public func startSession(mode: UInt8) async throws -> String {
+        stopTesterPresent()
         let hexMode = String(format: "%02X", mode)
         let command = "10" + hexMode
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 2.0)
+        let response = try await sendRequest(command, timeout: 2.0)
         let cleanResponse = normalizeResponse(response, service: 0x10)
 
         if cleanResponse.hasPrefix("7F10") {
@@ -109,7 +110,7 @@ public actor KWP2000Client {
             throw KWP2000Error.unexpectedResponse(expected: expectedResponse, received: response)
         }
 
-        if mode != 0x81 {
+        if mode != 0x81 && !Task.isCancelled {
             startTesterPresent()
         } else {
             stopTesterPresent()
@@ -122,7 +123,7 @@ public actor KWP2000Client {
     public func readLocalIdentifier(lid: UInt8) async throws -> String {
         let hexLid = String(format: "%02X", lid)
         let command = "21" + hexLid
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 1.5)
+        let response = try await sendRequest(command, timeout: 1.5)
         let cleanResponse = normalizeResponse(response, service: 0x21)
 
         if cleanResponse.hasPrefix("7F21") {
@@ -143,7 +144,7 @@ public actor KWP2000Client {
         let hexLid = String(format: "%02X", lid)
         let cleanData = data.replacing(" ", with: "")
         let command = "3B" + hexLid + cleanData
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 2.0)
+        let response = try await sendRequest(command, timeout: 2.0)
         let cleanResponse = normalizeResponse(response, service: 0x3B)
 
         if cleanResponse.hasPrefix("7F3B") {
@@ -161,14 +162,14 @@ public actor KWP2000Client {
 
     /// Effectue la routine SecurityAccess (Service 27) de manière atomique sans interférence TesterPresent.
     public func performSecurityAccess(level: UInt8, keyCalculator: @Sendable (String) -> String) async throws {
-        guard level < 0xFF else {
+        guard level >= 1 && level < 0xFF else {
             throw KWP2000Error.invalidSeedFormat
         }
         atomicTransactionDepth += 1
-        defer { atomicTransactionDepth -= 1 }
+        defer { atomicTransactionDepth = max(0, atomicTransactionDepth - 1) }
 
         let requestSeedCmd = String(format: "27%02X", level)
-        let seedResponse = try await interface.sendDiagnosticRequest(requestSeedCmd, timeout: 2.0)
+        let seedResponse = try await sendRequest(requestSeedCmd, timeout: 2.0)
         let cleanSeedResp = normalizeResponse(seedResponse, service: 0x27)
 
         if cleanSeedResp.hasPrefix("7F27") {
@@ -191,7 +192,7 @@ public actor KWP2000Client {
 
         let calculatedKey = keyCalculator(seed).replacing(" ", with: "").uppercased()
         let sendKeyCmd = String(format: "27%02X", level + 1) + calculatedKey
-        let keyResponse = try await interface.sendDiagnosticRequest(sendKeyCmd, timeout: 2.0)
+        let keyResponse = try await sendRequest(sendKeyCmd, timeout: 2.0)
         let cleanKeyResp = normalizeResponse(keyResponse, service: 0x27)
 
         if cleanKeyResp.hasPrefix("7F27") {
@@ -209,14 +210,14 @@ public actor KWP2000Client {
     /// en suspendant l'envoi de trames TesterPresent susceptibles de polluer la séquence.
     public func withAtomicTransaction<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
         atomicTransactionDepth += 1
-        defer { atomicTransactionDepth -= 1 }
+        defer { atomicTransactionDepth = max(0, atomicTransactionDepth - 1) }
         return try await operation()
     }
 
     /// Lit l'identification ECU (Service 1A)
     public func readECUIdentification(option: UInt8 = 0x80) async throws -> String {
         let command = String(format: "1A%02X", option)
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 2.0)
+        let response = try await sendRequest(command, timeout: 2.0)
         let clean = normalizeResponse(response, service: 0x1A)
 
         if clean.hasPrefix("7F1A") {
@@ -235,7 +236,7 @@ public actor KWP2000Client {
     /// Efface la mémoire des défauts (Service 14) selon ISO 14230 (groupe 2 octets, ex: "FF00")
     public func clearDiagnosticInformation(group: String = "FF00") async throws {
         let command = "14" + group.replacing(" ", with: "").uppercased()
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 3.0)
+        let response = try await sendRequest(command, timeout: 3.0)
         let clean = normalizeResponse(response, service: 0x14)
 
         if clean.hasPrefix("7F14") {
@@ -251,7 +252,7 @@ public actor KWP2000Client {
     /// Lit les DTCs par masque de statut (Service 18)
     public func readDTCByStatus(statusMask: UInt8 = 0x02, group: String = "FF00") async throws -> String {
         let command = String(format: "18%02X", statusMask) + group.replacing(" ", with: "").uppercased()
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 3.0)
+        let response = try await sendRequest(command, timeout: 3.0)
         let clean = normalizeResponse(response, service: 0x18)
 
         if clean.hasPrefix("7F18") {
@@ -310,7 +311,7 @@ public actor KWP2000Client {
         let dfiHex = dataFormatIdentifier.map { String(format: "%02X", $0) } ?? ""
         let sizeHex = String(format: "%06X", uncompressedSize & 0xFFFFFF)
         let command = "35" + addrHex + dfiHex + sizeHex
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 3.0)
+        let response = try await sendRequest(command, timeout: 3.0)
         let clean = normalizeResponse(response, service: 0x35)
 
         if clean.hasPrefix("7F35") {
@@ -333,7 +334,7 @@ public actor KWP2000Client {
         let dfiHex = dataFormatIdentifier.map { String(format: "%02X", $0) } ?? ""
         let sizeHex = String(format: "%06X", uncompressedSize & 0xFFFFFF)
         let command = "34" + addrHex + dfiHex + sizeHex
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 3.0)
+        let response = try await sendRequest(command, timeout: 3.0)
         let clean = normalizeResponse(response, service: 0x34)
 
         if clean.hasPrefix("7F34") {
@@ -351,7 +352,7 @@ public actor KWP2000Client {
         let addrHex = String(format: "%06X", memoryAddress & 0xFFFFFF)
         let sizeHex = String(format: "%02X", memorySize)
         let command = "23" + addrHex + sizeHex
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 3.0)
+        let response = try await sendRequest(command, timeout: 3.0)
         let clean = normalizeResponse(response, service: 0x23)
 
         if clean.hasPrefix("7F23") {
@@ -370,7 +371,7 @@ public actor KWP2000Client {
         let blockHex = String(format: "%02X", blockSequenceCounter)
         let cleanPayload = payload.replacing(" ", with: "").uppercased()
         let command = "36" + blockHex + cleanPayload
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 4.0)
+        let response = try await sendRequest(command, timeout: 4.0)
         let clean = normalizeResponse(response, service: 0x36)
 
         if clean.hasPrefix("7F36") {
@@ -401,7 +402,7 @@ public actor KWP2000Client {
 
     /// Sortie du mode transfert (Service 37 - Request Transfer Exit)
     public func requestTransferExit() async throws -> String {
-        let response = try await interface.sendDiagnosticRequest("37", timeout: 2.0)
+        let response = try await sendRequest("37", timeout: 2.0)
         let clean = normalizeResponse(response, service: 0x37)
 
         if clean.hasPrefix("7F37") {
@@ -420,7 +421,7 @@ public actor KWP2000Client {
         let cmdId = String(format: "%04X", routineId)
         let cleanOptions = options.replacing(" ", with: "").uppercased()
         let command = "31" + cmdType + cmdId + cleanOptions
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 4.0)
+        let response = try await sendRequest(command, timeout: 4.0)
         let clean = normalizeResponse(response, service: 0x31)
 
         if clean.hasPrefix("7F31") {
@@ -436,7 +437,7 @@ public actor KWP2000Client {
     /// Redémarrage du calculateur (Service 11 - ECU Reset)
     public func ecuReset(resetType: UInt8 = 0x01) async throws {
         let command = String(format: "11%02X", resetType)
-        let response = try await interface.sendDiagnosticRequest(command, timeout: 2.0)
+        let response = try await sendRequest(command, timeout: 2.0)
         let clean = normalizeResponse(response, service: 0x11)
 
         if clean.hasPrefix("7F11") {
@@ -448,8 +449,14 @@ public actor KWP2000Client {
         }
     }
 
+    private func sendRequest(_ command: String, timeout: TimeInterval) async throws -> String {
+        atomicTransactionDepth += 1
+        defer { atomicTransactionDepth = max(0, atomicTransactionDepth - 1) }
+        return try await interface.sendDiagnosticRequest(command, timeout: timeout)
+    }
+
     private func normalizeResponse(_ response: String, service: UInt8) -> String {
-        var clean = response
+        var clean = HexParsing.stripISOTPFraming(response)
             .replacing(" ", with: "")
             .replacing("\n", with: "")
             .replacing("\r", with: "")

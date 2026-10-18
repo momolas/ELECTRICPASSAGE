@@ -1,7 +1,4 @@
 import Foundation
-#if canImport(Accelerate)
-import Accelerate
-#endif
 
 /// Module de filtrage et lissage numérique de signaux télémétriques automobiles (PIDs, bus CAN).
 public enum SignalFilter: Sendable {

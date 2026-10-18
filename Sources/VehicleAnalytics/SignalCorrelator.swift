@@ -55,6 +55,12 @@ public enum SignalCorrelator: Sendable {
               x.allSatisfy(\.isFinite), y.allSatisfy(\.isFinite) else { return nil }
 
         #if canImport(Accelerate)
+        // Garde d'invariance stricte : élimine le bruit d'arrondi de 1 ULP sur (N * c) / N pour un signal constant à fort offset DC
+        guard vDSP.minimum(x) < vDSP.maximum(x),
+              vDSP.minimum(y) < vDSP.maximum(y) else {
+            return nil
+        }
+
         let meanX = vDSP.mean(x)
         let meanY = vDSP.mean(y)
 
@@ -72,6 +78,11 @@ public enum SignalCorrelator: Sendable {
         guard r.isFinite else { return nil }
         return max(-1.0, min(1.0, r))
         #else
+        guard let minX = x.min(), let maxX = x.max(), minX < maxX,
+              let minY = y.min(), let maxY = y.max(), minY < maxY else {
+            return nil
+        }
+
         let n = Double(x.count)
         let meanX = x.reduce(0, +) / n
         let meanY = y.reduce(0, +) / n
@@ -222,7 +233,16 @@ public enum SignalCorrelator: Sendable {
             }
         }
 
-        return results.sorted { abs($0.coefficient) > abs($1.coefficient) }
+        return results.sorted { lhs, rhs in
+            let diff = abs(lhs.coefficient) - abs(rhs.coefficient)
+            if abs(diff) > 1e-12 {
+                return diff > 0
+            }
+            if lhs.sliceName != rhs.sliceName {
+                return lhs.sliceName < rhs.sliceName
+            }
+            return lhs.referenceSignal < rhs.referenceSignal
+        }
     }
 
     /// Classification heuristique basée sur le coefficient r et la plage dynamique

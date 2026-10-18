@@ -1459,7 +1459,7 @@ struct VehicleKitTests {
         // Spawn a waiter that gets cancelled while waiting in queue
         let cancelledTask = Task { @MainActor in
             try await coordinator.withExclusiveAccess(priority: .interactive, name: "CancelledWaiter") {
-                Issue.record("Cancelled waiter should not execute operation")
+                _ = Issue.record("Cancelled waiter should not execute operation")
             }
         }
 
@@ -1468,7 +1468,7 @@ struct VehicleKitTests {
 
         do {
             try await cancelledTask.value
-            Issue.record("Expected CancellationError")
+            _ = Issue.record("Expected CancellationError")
         } catch is CancellationError {
             // Expected
         }
@@ -1704,5 +1704,246 @@ struct VehicleKitTests {
         let kwpMem = try await kwp.readMemoryByAddress(memoryAddress: 0x040000, memorySize: 16)
         #expect(String(decoding: kwpMem, as: UTF8.self) == "8200399038_S3000")
         _ = try await kwp.transferDataBytes(blockSequenceCounter: 1, payload: Data([0x01, 0x02, 0x03, 0x04]))
+    }
+
+    @Test("ECUFlashValidator KWP2000 2180 Multi-Token HW, Trailing Sector Diff & Voltage Finitude")
+    func testECUFlashValidatorEdgeCases() throws {
+        // 1. Non-zero startIndex Data slices & sectorSize <= 0 safety
+        let prefix = Data(repeating: 0xAA, count: 16)
+        let payloadA = Data((0..<4096).map { UInt8($0 & 0xFF) })
+        let payloadB = Data([0xFF] + payloadA.dropFirst())
+        let sliceA = (prefix + payloadA)[16..<(16 + 4096)]
+        let sliceB = (prefix + payloadB)[16..<(16 + 4096)]
+
+        #expect(sliceA.startIndex == 16)
+        #expect(ECUFlashValidator.crc32(sliceA) == ECUFlashValidator.crc32(payloadA))
+        #expect(ECUFlashValidator.checksum16(sliceA) == ECUFlashValidator.checksum16(payloadA))
+
+        let zeroSectorDiff = ECUFlashValidator.compare(original: sliceA, modified: sliceB, sectorSize: 0)
+        #expect(zeroSectorDiff.changedBytesCount == 1)
+        #expect(zeroSectorDiff.modifiedSectors.count == 1)
+
+        // 2. Size mismatch (4096 vs 8192) must record trailing sector in modifiedSectors
+        let extendedMod = payloadA + Data(repeating: 0x42, count: 4096)
+        let sizeMismatchDiff = ECUFlashValidator.compare(original: payloadA, modified: extendedMod, sectorSize: 4096)
+        #expect(sizeMismatchDiff.changedBytesCount == 4096)
+        #expect(sizeMismatchDiff.totalSectors == 2)
+        #expect(sizeMismatchDiff.modifiedSectors.count == 1)
+
+        // 3. KWP2000 21 80 multi-token hardwareNumber ("HW-8200298457 (MPR 8200399038)") must pass Pre-Flight
+        let kwpCal = try #require(
+            CalibrationReader.parseKWP2000Identification2180(
+                "61 80 82 00 39 90 38 44 00 31 37 82 00 29 84 57 00 B2 04 30 01 05"
+            )
+        )
+        let stockBin = ECUFlashValidator.buildSyntheticStockCalibration(calibration: kwpCal, size: 65536)
+        let meta = ECUFlashValidator.inspect(data: stockBin)
+        let kwpPreFlight = ECUFlashValidator.evaluatePreFlight(
+            batteryVoltage: 13.5,
+            metadata: meta,
+            ecuCalibration: kwpCal,
+            hasStockBackupInVault: true
+        )
+        #expect(kwpPreFlight.isTargetCompatible == true)
+        #expect(kwpPreFlight.canProceedWithFlash == true)
+
+        // 4. Infinite or over-voltage battery (> 15.8 V) must be rejected by Pre-Flight Gate
+        let infReport = ECUFlashValidator.evaluatePreFlight(
+            batteryVoltage: .infinity,
+            metadata: meta,
+            ecuCalibration: kwpCal,
+            hasStockBackupInVault: true
+        )
+        #expect(infReport.isBatteryVoltageSafe == false)
+        #expect(infReport.canProceedWithFlash == false)
+
+        let overVoltReport = ECUFlashValidator.evaluatePreFlight(
+            batteryVoltage: 16.5,
+            metadata: meta,
+            ecuCalibration: kwpCal,
+            hasStockBackupInVault: true
+        )
+        #expect(overVoltReport.isBatteryVoltageSafe == false)
+        #expect(overVoltReport.canProceedWithFlash == false)
+    }
+
+    @Test("UDSClient SecurityAccess Level 0 Guard, ALFID Bounds & MaxBlockLength Shift Safety")
+    func testUDSClientBoundsAndShiftSafety() async throws {
+        actor MockUDSInterface: VehicleInterface {
+            var lastRequest: String = ""
+            var nextResponse: String = "74 20 04 00"
+            func setNextResponse(_ resp: String) {
+                nextResponse = resp
+            }
+            func setTarget(txID: String, rxID: String?) async throws {}
+            func sendDiagnosticRequest(_ requestHex: String, timeout: TimeInterval) async throws -> String {
+                lastRequest = requestHex
+                return nextResponse
+            }
+        }
+
+        let mock = MockUDSInterface()
+        let client = UDSClient(interface: mock)
+
+        // 1. level == 0 must throw UDSError instead of trapping on UInt8(0) - 1
+        await #expect(throws: UDSClient.UDSError.self) {
+            try await client.performSecurityAccess(level: 0) { _ in "0000" }
+        }
+
+        // 2. Out-of-bounds ALFID (addrBytes == 0 or > 4, sizeBytes == 0 or > 4) must throw
+        await #expect(throws: UDSClient.UDSError.self) {
+            _ = try await client.readMemoryByAddress(
+                memoryAddress: 0x1000,
+                memorySize: 16,
+                addressAndLengthFormatIdentifier: 0x00
+            )
+        }
+
+        // 3. 2-byte address + 2-byte size (ALFID 0x22) must encode 2-byte address (23 22 1000 0010)
+        await mock.setNextResponse("63 AA BB")
+        let readBytes = try await client.readMemoryByAddress(
+            memoryAddress: 0x1000,
+            memorySize: 0x0010,
+            addressAndLengthFormatIdentifier: 0x22
+        )
+        #expect(readBytes == Data([0xAA, 0xBB]))
+        let sentCmd = await mock.lastRequest
+        #expect(sentCmd == "232210000010")
+    }
+
+    @Test("SignalCorrelator Constant High-DC-Offset Signal Must Return Nil & Deterministic Tie-Breaking")
+    func testSignalCorrelatorConstantHighOffsetCancellation() {
+        let constantValue: Double = 1e10 / 3.0
+        let constantSignal = [Double](repeating: constantValue, count: 7)
+        let rampSignal = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 100.0]
+
+        let rSelf = SignalCorrelator.pearsonCorrelation(x: constantSignal, y: constantSignal)
+        #expect(rSelf == nil)
+
+        let rCross = SignalCorrelator.pearsonCorrelation(x: constantSignal, y: rampSignal)
+        #expect(rCross == nil)
+
+        // Deterministic tie-breaking when two slices have identical correlation
+        let rows: [[UInt8]] = (1...8).map { [UInt8($0), UInt8($0)] }
+        let refs: [String: [Double]] = ["RPM": (1...8).map(Double.init)]
+        let c1 = SignalCorrelator.correlateSlices(byteRows: rows, references: refs).map(\.sliceName)
+        let c2 = SignalCorrelator.correlateSlices(byteRows: rows, references: refs).map(\.sliceName)
+        #expect(c1 == c2)
+        #expect(c1.first == "A")
+    }
+
+    @Test("PandaDriver Non-Zero Data Slices, CAN ID 0x000 Unpacking & TX Echo Bus Bit")
+    func testPandaDriverSlicesAndEdgeCases() throws {
+        #expect(PandaSafetyModel.chrysler.rawValue == 9)
+        #expect(PandaSafetyModel.chrylsler == .chrysler)
+
+        let directHealth = PandaHealth(uptime: 42, voltageMV: 13800, currentMA: 250, ignitionLine: true)
+        #expect(directHealth.uptime == 42)
+        #expect(directHealth.ignitionLine == true)
+
+        let padding = Data(repeating: 0xCC, count: 12)
+        let rawPayload = (padding + Data([0x02, 0x10, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00]))[12..<20]
+        #expect(rawPayload.startIndex == 12)
+
+        let packed = PandaDriver.packBxCAN16(address: 0x7E8, data: rawPayload, bus: 1)
+        let slicedStream = (padding + packed)[12..<(12 + 16)]
+        #expect(slicedStream.startIndex == 12)
+
+        let unpacked = PandaDriver.unpackBxCAN16(data: slicedStream)
+        let firstFrame = try #require(unpacked.first)
+        #expect(firstFrame.address == 0x7E8)
+        #expect(firstFrame.bus == 1)
+        #expect(firstFrame.data == Data([0x02, 0x10, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00]))
+
+        // STM32F4 hardware RX mailbox for CAN ID 0x000 (RIR == 0, RDTR == 2 with 2-byte payload)
+        var hwFrameID0 = Data(count: 16)
+        hwFrameID0[4] = 0x02 // DLC = 2, bus = 0
+        hwFrameID0[8] = 0xCA
+        hwFrameID0[9] = 0xFE
+        let id0Frames = PandaDriver.unpackBxCAN16(data: hwFrameID0)
+        #expect(id0Frames.count == 1)
+        #expect(id0Frames.first?.address == 0x000)
+        #expect(id0Frames.first?.data == Data([0xCA, 0xFE]))
+    }
+
+    @Test("SimulatorEngine & UDSClient 0x23 / 0x36 Short Frame NRC & BSC Validation")
+    func testSimulatorAndUDSTransferDataEdgeCases() async throws {
+        let sim = SimulatorEngine()
+
+        let short23 = try await sim.sendDiagnosticRequest("23")
+        #expect(short23.replacing(" ", with: "") == "7F2313")
+
+        let short36 = try await sim.sendDiagnosticRequest("36")
+        #expect(short36.replacing(" ", with: "") == "7F3613")
+
+        actor MismatchedBSCDriver: VehicleInterface {
+            func setTarget(txID: String, rxID: String?) async throws {}
+            func sendDiagnosticRequest(_ requestHex: String, timeout: TimeInterval) async throws -> String {
+                return "76 02 AA BB" // Echoes BSC 0x02 when 0x01 was requested
+            }
+        }
+
+        let badBSCClient = UDSClient(interface: MismatchedBSCDriver())
+        await #expect(throws: UDSClient.UDSError.self) {
+            _ = try await badBSCClient.transferData(blockSequenceCounter: 0x01, payload: Data([0x11, 0x22]))
+        }
+    }
+
+    @Test("CANIntrusionDetector Sliding Window Eviction Recovery & Mode 06 Signed/Multi-Frame Decoding")
+    func testCANIntrusionDetectorWindowEvictionAndMode06Signed() async {
+        let detector = CANIntrusionDetector(windowSize: 20)
+        var t = 0.0
+
+        // 1. Inject 6 rapid jittery frames on 0x666
+        let burstIntervals = [0.0001, 0.012, 0.0001, 0.0001, 0.0001, 0.0001]
+        for dt in burstIntervals {
+            t += dt
+            _ = await detector.ingest(
+                frame: CANSampleFrame(
+                    canID: 0x666,
+                    payload: [0x01, 0x02],
+                    timestampSeconds: t
+                )
+            )
+        }
+
+        // Fill window to >= 10 frames so security evaluation activates
+        for i in 0..<6 {
+            t += 0.020
+            _ = await detector.ingest(
+                frame: CANSampleFrame(
+                    canID: 0x100,
+                    payload: [UInt8(i), 0x10],
+                    timestampSeconds: t
+                )
+            )
+        }
+        let activeBurstReport = await detector.evaluateSecurity()
+        #expect(activeBurstReport.status == .injectionDetected)
+        #expect(activeBurstReport.flaggedIDs.contains(0x666))
+
+        // 2. Evict all 0x666 frames by ingesting 25 normal periodic frames on 0x100
+        for i in 0..<25 {
+            t += 0.020
+            _ = await detector.ingest(
+                frame: CANSampleFrame(
+                    canID: 0x100,
+                    payload: [UInt8(i & 0xFF), 0x20, 0x30, 0x40],
+                    timestampSeconds: t
+                )
+            )
+        }
+        let postEvictionReport = await detector.evaluateSecurity()
+        #expect(postEvictionReport.status == .nominal)
+        #expect(!postEvictionReport.flaggedIDs.contains(0x666))
+
+        // 3. Mode 06 signed two's complement (cid >= 0x80: Val = -10, Min = -50, Max = +50) & ISO-TP multi-frame
+        let multiFrameSignedMode06 = "00A\n0: 46 01 01 81 FF F6\n1: FF CE 00 32"
+        let mode06Results: [OBD2Mode06TestResult] = OBD2Analyzer.decodeMode06(responseHex: multiFrameSignedMode06)
+        #expect(mode06Results.count == 1)
+        #expect(mode06Results.first?.testValue == -10.0)
+        #expect(mode06Results.first?.minLimit == -50.0)
+        #expect(mode06Results.first?.maxLimit == 50.0)
+        #expect(mode06Results.first?.isPassed == true)
     }
 }

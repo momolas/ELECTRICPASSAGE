@@ -136,15 +136,19 @@ public enum ECUFlashValidator: Sendable {
     /// Calcule la somme de contrôle modulaire 16 bits (Big-Endian) utilisée sur les blocs de calibration Bosch/Siemens.
     public static func checksum16(_ data: Data) -> UInt16 {
         var sum: UInt16 = 0
-        let bytes = [UInt8](data)
-        var i = 0
-        while i + 1 < bytes.count {
-            let word = (UInt16(bytes[i]) << 8) | UInt16(bytes[i + 1])
-            sum = sum &+ word
-            i += 2
-        }
-        if i < bytes.count {
-            sum = sum &+ (UInt16(bytes[i]) << 8)
+        var idx = data.startIndex
+        let end = data.endIndex
+        while idx < end {
+            let b0 = UInt16(data[idx])
+            let nextIdx = data.index(after: idx)
+            if nextIdx < end {
+                let b1 = UInt16(data[nextIdx])
+                sum = sum &+ ((b0 << 8) | b1)
+                idx = data.index(after: nextIdx)
+            } else {
+                sum = sum &+ (b0 << 8)
+                idx = nextIdx
+            }
         }
         return sum
     }
@@ -217,17 +221,23 @@ public enum ECUFlashValidator: Sendable {
         let origBytes = [UInt8](original)
         let modBytes = [UInt8](modified)
 
-        var totalChanged = abs(original.count - modified.count)
+        var totalChanged = 0
         var modifiedSectors: [ECUBinaryDiffReport.ModifiedSector] = []
         let totalSectors = maxLen > 0 ? ((maxLen + safeSectorSize - 1) / safeSectorSize) : 0
 
         for sectorIdx in 0..<totalSectors {
             let start = sectorIdx * safeSectorSize
-            let end = min(start + safeSectorSize, minLen)
+            let end = min(start + safeSectorSize, maxLen)
             guard start < end else { continue }
             var sectorDiff = 0
-            for i in start..<end where origBytes[i] != modBytes[i] {
-                sectorDiff += 1
+            for i in start..<end {
+                if i < minLen {
+                    if origBytes[i] != modBytes[i] {
+                        sectorDiff += 1
+                    }
+                } else {
+                    sectorDiff += 1
+                }
             }
             if sectorDiff > 0 {
                 totalChanged += sectorDiff
@@ -252,11 +262,12 @@ public enum ECUFlashValidator: Sendable {
         if !sizeMatches {
             warning = "Taille du fichier modifié (\(modified.count) octets) différente de l'origine (\(original.count) octets)."
         } else if let hw = ecuCalibration?.hardwareNumber {
-            // Vérifie que la référence matérielle (ex: 8200298457) est cohérente si présente dans le binaire
-            let digitsOnly = hw.filter(\.isNumber)
-            if digitsOnly.count >= 8 && !modAscii.isEmpty && !modAscii.contains(digitsOnly) && origAscii.contains(digitsOnly) {
+            // Extrait chaque jeton numérique distinct d'au moins 8 chiffres (ex: HW 8200298457 et MPR 8200399038)
+            let tokens = hw.split { !$0.isNumber }.map(String.init).filter { $0.count >= 8 }
+            if let primaryToken = tokens.first,
+               !modAscii.isEmpty && !modAscii.contains(primaryToken) && origAscii.contains(primaryToken) {
                 hwSwCompatible = false
-                warning = "Incompatibilité matérielle (HW mismatch) : la référence \(digitsOnly) est absente du fichier modifié."
+                warning = "Incompatibilité matérielle (HW mismatch) : la référence \(primaryToken) est absente du fichier modifié."
             }
         }
 
@@ -282,9 +293,12 @@ public enum ECUFlashValidator: Sendable {
     ) -> ECUFlashPreFlightReport {
         var reasons: [String] = []
 
-        let isVoltageSafe = batteryVoltage >= 12.5
-        if !isVoltageSafe {
-            reasons.append("Tension batterie insuffisante (\(batteryVoltage.formatted(.number.precision(.fractionLength(2)))) V < 12.50 V). Branchez un maintien de charge.")
+        let isVoltageSafe = batteryVoltage.isFinite && batteryVoltage >= 12.5 && batteryVoltage <= 15.8
+        if !batteryVoltage.isFinite || batteryVoltage < 12.5 {
+            let formatted = batteryVoltage.isFinite ? batteryVoltage.formatted(.number.precision(.fractionLength(2))) : "N/A"
+            reasons.append("Tension batterie insuffisante (\(formatted) V < 12.50 V). Branchez un maintien de charge.")
+        } else if batteryVoltage > 15.8 {
+            reasons.append("Surtension batterie dangereuse (\(batteryVoltage.formatted(.number.precision(.fractionLength(2)))) V > 15.80 V). Vérifiez le chargeur/alternateur.")
         }
 
         let isBinaryValid = metadata.isValidSize && !metadata.isAllBlankOrZero
@@ -299,8 +313,8 @@ public enum ECUFlashValidator: Sendable {
         if let cal = ecuCalibration, !metadata.detectedASCIIIdentifiers.isEmpty {
             let joinedMeta = metadata.detectedASCIIIdentifiers.joined(separator: " ").uppercased()
             if let hw = cal.hardwareNumber {
-                let hwDigits = hw.filter(\.isNumber)
-                if hwDigits.count >= 8 && !joinedMeta.contains(hwDigits) {
+                let tokens = hw.split { !$0.isNumber }.map(String.init).filter { $0.count >= 8 }
+                if let primaryToken = tokens.first, !joinedMeta.contains(primaryToken) {
                     isTargetCompatible = false
                     reasons.append("Référence matérielle ECU (\(hw)) absente des signatures du fichier binaire.")
                 }

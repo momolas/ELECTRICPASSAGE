@@ -55,6 +55,9 @@ public actor ISOTPReassembler {
 
             if rawLength > 0 {
                 // Classic CAN Single Frame (1 à 7 octets)
+                guard rawLength <= 7 else {
+                    return .error("Longueur Single Frame classique invalide (\(rawLength) > 7)")
+                }
                 length = rawLength
                 guard frame.count >= length + 1 else {
                     return .error("Trame Single Frame trop courte pour la longueur déclarée (\(length))")
@@ -66,8 +69,8 @@ public actor ISOTPReassembler {
                     return .error("Trame CAN-FD Single Frame incomplète")
                 }
                 length = Int(frame[1])
-                guard length > 0 else {
-                    return .error("Longueur CAN-FD Single Frame invalide (0)")
+                guard length >= 8 && length <= 62 else {
+                    return .error("Longueur CAN-FD Single Frame hors bornes (\(length))")
                 }
                 guard frame.count >= length + 2 else {
                     return .error("Trame CAN-FD Single Frame trop courte pour la longueur déclarée (\(length))")
@@ -79,7 +82,7 @@ public actor ISOTPReassembler {
             return .completed(Data(payload))
 
         case 1: // First Frame (FF)
-            guard frame.count >= 2 else {
+            guard frame.count >= 8 else {
                 return .error("Trame First Frame incomplète")
             }
             let maxISOTPPayload = 65536
@@ -89,9 +92,6 @@ public actor ISOTPReassembler {
 
             if rawLength == 0 {
                 // ISO 15765-2:2016 CAN-FD First Frame avec longueur étendue sur 32 bits (DL > 4095)
-                guard frame.count >= 6 else {
-                    return .error("Trame CAN-FD First Frame 32-bit incomplète")
-                }
                 let len32 = (UInt32(frame[2]) << 24) | (UInt32(frame[3]) << 16) | (UInt32(frame[4]) << 8) | UInt32(frame[5])
                 length = Int(len32)
                 guard length > 4095 && length <= maxISOTPPayload else {
@@ -100,14 +100,15 @@ public actor ISOTPReassembler {
                 payload = frame[6...]
             } else {
                 // Classic CAN First Frame (DL <= 4095)
-                guard frame.count >= 8 else {
-                    return .error("Trame First Frame incomplète")
-                }
                 length = rawLength
                 guard length > 7 && length <= maxISOTPPayload else {
                     return .error("Invalid or oversized First Frame length: \(length)")
                 }
                 payload = frame[2...]
+            }
+
+            guard payload.count < length else {
+                return .error("Trame First Frame contient déjà >= la longueur totale déclarée (\(length))")
             }
 
             var initialBuffer = Data()
@@ -121,6 +122,9 @@ public actor ISOTPReassembler {
             return .needsFlowControl
 
         case 2: // Consecutive Frame (CF)
+            guard frame.count >= 2 else {
+                return .error("Trame Consecutive Frame vide")
+            }
             guard var state = states[address] else {
                 return .error("Trame Consecutive Frame orpheline sur 0x\(String(format: "%X", address))")
             }

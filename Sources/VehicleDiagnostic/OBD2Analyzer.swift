@@ -599,7 +599,8 @@ public final class OBD2Analyzer: Sendable {
 
     /// Décode une réponse hexadécimale OBD-II Mode 06 (On-Board Monitoring Test Results)
     public static func decodeMode06(responseHex: String) -> [OBD2Mode06TestResult] {
-        guard let allBytes = HexParsing.bytes(responseHex), !allBytes.isEmpty else { return [] }
+        let stripped = HexParsing.stripISOTPFraming(responseHex)
+        guard let allBytes = HexParsing.bytes(stripped), !allBytes.isEmpty else { return [] }
 
         // Retirer l'écho de service 0x46 si présent
         var payload = allBytes
@@ -620,9 +621,20 @@ public final class OBD2Analyzer: Sendable {
             let rawMin = (UInt16(payload[offset + 5]) << 8) | UInt16(payload[offset + 6])
             let rawMax = (UInt16(payload[offset + 7]) << 8) | UInt16(payload[offset + 8])
 
-            let testValue = Double(rawVal)
-            let minLimit: Double? = (rawMin == 0xFFFF) ? nil : Double(rawMin)
-            let maxLimit: Double? = (rawMax == 0xFFFF) ? nil : Double(rawMax)
+            let isSigned = (cid & 0x80) != 0
+            let testValue: Double
+            let minLimit: Double?
+            let maxLimit: Double?
+
+            if isSigned {
+                testValue = Double(Int16(bitPattern: rawVal))
+                minLimit = Double(Int16(bitPattern: rawMin))
+                maxLimit = Double(Int16(bitPattern: rawMax))
+            } else {
+                testValue = Double(rawVal)
+                minLimit = (rawMin == 0xFFFF) ? nil : Double(rawMin)
+                maxLimit = (rawMax == 0xFFFF) ? nil : Double(rawMax)
+            }
 
             var passed = true
             if let min = minLimit, testValue < min {
@@ -653,3 +665,5 @@ public final class OBD2Analyzer: Sendable {
         return results
     }
 }
+
+public typealias OBD2Mode06TestResult = OBD2Analyzer.OBD2Mode06TestResult

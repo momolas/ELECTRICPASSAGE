@@ -94,9 +94,11 @@ public enum CalibrationReader: Sendable {
             try Task.checkCancellation()
             try await interface.setTarget(txID: "7E0", rxID: "7E8")
             let rawCal = try? await interface.sendDiagnosticRequest("0904", timeout: 2.0)
+            try Task.checkCancellation()
             let calIDs = rawCal.map(parseOBD2CalID) ?? []
 
             let rawCVN = try? await interface.sendDiagnosticRequest("0906", timeout: 2.0)
+            try Task.checkCancellation()
             let cvns = rawCVN.map(parseOBD2CVN) ?? []
 
             if !calIDs.isEmpty || !cvns.isEmpty {
@@ -117,19 +119,24 @@ public enum CalibrationReader: Sendable {
             try Task.checkCancellation()
             try await interface.setTarget(txID: "7E0", rxID: "7E8")
             let rawCal = try? await interface.sendDiagnosticRequest("22F198", timeout: 1.5)
+            try Task.checkCancellation()
             var calID = rawCal.flatMap { parseUDSIdentifier($0, did: "F198") }
             if calID == nil {
                 let rawAppCal = try? await interface.sendDiagnosticRequest("22F182", timeout: 1.5)
+                try Task.checkCancellation()
                 calID = rawAppCal.flatMap { parseUDSIdentifier($0, did: "F182") }
             }
 
             let rawSW = try? await interface.sendDiagnosticRequest("22F188", timeout: 1.5)
+            try Task.checkCancellation()
             let swNum = rawSW.flatMap { parseUDSIdentifier($0, did: "F188") }
 
             let rawHW = try? await interface.sendDiagnosticRequest("22F191", timeout: 1.5)
+            try Task.checkCancellation()
             let hwNum = rawHW.flatMap { parseUDSIdentifier($0, did: "F191") }
 
             let rawCVN = try? await interface.sendDiagnosticRequest("22F199", timeout: 1.5)
+            try Task.checkCancellation()
             let cvnHex = rawCVN.flatMap { parseUDSHexPayload($0, did: "F199") }
 
             var uniqueCals: [String] = []
@@ -155,12 +162,14 @@ public enum CalibrationReader: Sendable {
         do {
             try Task.checkCancellation()
             try await interface.setTarget(txID: "7E0", rxID: "7E8")
-            _ = try? await openDiagnosticSession(interface: interface)
+            _ = try await openDiagnosticSession(interface: interface)
+            try Task.checkCancellation()
             if let raw2180 = try? await interface.sendDiagnosticRequest("2180", timeout: 2.0),
                let info = parseKWP2000Identification2180(raw2180) {
                 await closeDiagnosticSession(interface: interface)
                 return info
             }
+            try Task.checkCancellation()
             await closeDiagnosticSession(interface: interface)
         } catch is CancellationError {
             throw CancellationError()
@@ -313,6 +322,7 @@ public enum CalibrationReader: Sendable {
 
     private static func openDiagnosticSession(interface: VehicleInterface) async throws -> Bool {
         for sessionCmd in ["1085", "1086", "1003"] {
+            try Task.checkCancellation()
             if let res = try? await interface.sendDiagnosticRequest(sessionCmd, timeout: 1.0) {
                 let normalized = res.uppercased().replacing(" ", with: "")
                 if !normalized.starts(with: "7F") && !normalized.isEmpty {

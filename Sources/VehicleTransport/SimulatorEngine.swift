@@ -265,6 +265,9 @@ public actor SimulatorEngine: VehicleInterface {
 
         // 9b. Read Memory By Address (23) / Communication Control (28) / Control DTC Setting (85)
         if clean.hasPrefix("23") {
+            guard clean.count >= 8 && clean.count % 2 == 0 else {
+                return "7F2313"
+            }
             // Retourne un bloc de mémoire contenant "8200399038_S3000" en ASCII hexadécimal
             return "63 38 32 30 30 33 39 39 30 33 38 5F 53 33 30 30 30"
         }
@@ -288,14 +291,23 @@ public actor SimulatorEngine: VehicleInterface {
             return "7101"
         }
         if clean.hasPrefix("34") {
+            guard clean.count >= 8 && clean.count % 2 == 0 else {
+                return "7F3413"
+            }
             return "74 20 04 00"
         }
         if clean.hasPrefix("35") {
+            guard clean.count >= 8 && clean.count % 2 == 0 else {
+                return "7F3513"
+            }
             return "75 20 04 00"
         }
         if clean.hasPrefix("36") {
+            guard clean.count >= 4 && clean.count % 2 == 0 else {
+                return "7F3613"
+            }
             let bsc = String(clean.dropFirst(2).prefix(2))
-            return "76 " + (bsc.isEmpty ? "01" : bsc)
+            return "76 " + bsc
         }
         if clean.hasPrefix("37") {
             return "77"

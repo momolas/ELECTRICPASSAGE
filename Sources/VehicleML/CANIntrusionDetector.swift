@@ -61,7 +61,7 @@ public actor CANIntrusionDetector {
     private var totalByteCount: Int = 0
 
     public init(windowSize: Int = 100) {
-        self.windowSize = windowSize
+        self.windowSize = max(10, windowSize)
     }
 
     /// Réinitialise l'historique d'acquisition
@@ -92,10 +92,8 @@ public actor CANIntrusionDetector {
             let remainingCount = idCounts[evicted.canID, default: 1] - 1
             if remainingCount <= 0 {
                 idCounts.removeValue(forKey: evicted.canID)
-                if idLastTimestamp.count > 256 {
-                    idLastTimestamp.removeValue(forKey: evicted.canID)
-                    idIntervals.removeValue(forKey: evicted.canID)
-                }
+                idLastTimestamp.removeValue(forKey: evicted.canID)
+                idIntervals.removeValue(forKey: evicted.canID)
             } else {
                 idCounts[evicted.canID] = remainingCount
             }
@@ -168,9 +166,9 @@ public actor CANIntrusionDetector {
         }
         let recentAvgDtMs = recentPairs > 0 ? (recentDtSum / Double(recentPairs)) : 10.0
 
-        // 3. Détection de gigue anormale sur les IDs périodiques
+        // 3. Détection de gigue anormale sur les IDs périodiques actifs dans la fenêtre
         var suspiciousIDs: [UInt32] = []
-        for (id, intervals) in idIntervals where intervals.count >= 5 {
+        for (id, intervals) in idIntervals where intervals.count >= 5 && (idCounts[id] ?? 0) > 0 {
             let mean = intervals.reduce(0, +) / Double(intervals.count)
             let variance = intervals.reduce(0) { $0 + pow($1 - mean, 2) } / Double(intervals.count)
             let stdDev = sqrt(variance)

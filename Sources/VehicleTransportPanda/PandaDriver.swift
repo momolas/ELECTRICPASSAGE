@@ -12,7 +12,7 @@ public enum PandaSafetyModel: UInt16, Sendable {
     case ford = 6
     case cadillac = 7
     case hyundai = 8
-    case chrylsler = 9
+    case chrysler = 9
     case tesla = 10
     case subaru = 11
     case mazda = 12
@@ -20,6 +20,8 @@ public enum PandaSafetyModel: UInt16, Sendable {
     case volkswagen = 14
     case toyotaIp = 15
     case allOutput = 17
+
+    public static let chrylsler: PandaSafetyModel = .chrysler
 }
 
 public enum PandaHardwareType: UInt8, Sendable {
@@ -51,6 +53,44 @@ public struct PandaHealth: Sendable, Equatable {
     public let safetyModel: UInt8
     public let faultStatus: UInt8
     public let powerSaveEnabled: Bool
+
+    public nonisolated init(
+        uptime: UInt32,
+        voltageMV: UInt32,
+        currentMA: UInt32,
+        canRxErrs: UInt32 = 0,
+        canSendErrs: UInt32 = 0,
+        canFwdErrs: UInt32 = 0,
+        gmlanSendErrs: UInt32 = 0,
+        faults: UInt32 = 0,
+        ignitionLine: Bool = false,
+        ignitionCan: Bool = false,
+        controlsAllowed: Bool = false,
+        gasInterceptorDetected: Bool = false,
+        carHarnessStatus: UInt8 = 0,
+        usbPowerMode: UInt8 = 0,
+        safetyModel: UInt8 = 0,
+        faultStatus: UInt8 = 0,
+        powerSaveEnabled: Bool = false
+    ) {
+        self.uptime = uptime
+        self.voltageMV = voltageMV
+        self.currentMA = currentMA
+        self.canRxErrs = canRxErrs
+        self.canSendErrs = canSendErrs
+        self.canFwdErrs = canFwdErrs
+        self.gmlanSendErrs = gmlanSendErrs
+        self.faults = faults
+        self.ignitionLine = ignitionLine
+        self.ignitionCan = ignitionCan
+        self.controlsAllowed = controlsAllowed
+        self.gasInterceptorDetected = gasInterceptorDetected
+        self.carHarnessStatus = carHarnessStatus
+        self.usbPowerMode = usbPowerMode
+        self.safetyModel = safetyModel
+        self.faultStatus = faultStatus
+        self.powerSaveEnabled = powerSaveEnabled
+    }
 
     public nonisolated init?(data: Data) {
         guard data.count >= 41 else { return nil }
@@ -112,7 +152,7 @@ public actor PandaDriver: VehicleInterface {
             ? ((address & 0x1FFF_FFFF) << 3) | 0b101
             : ((address & 0x7FF) << 21) | 0b001
         let dlc = UInt32(min(data.count, 8) & 0xF)
-        let rdtr: UInt32 = dlc | (UInt32(bus & 0x7) << 4)
+        let rdtr: UInt32 = dlc | (UInt32(bus & 0x87) << 4)
 
         var packet = Data(count: 16)
         packet[0] = UInt8(rir & 0xFF)
@@ -147,7 +187,7 @@ public actor PandaDriver: VehicleInterface {
                        (UInt32(data[offset + 7]) << 24)
             offset += 16
 
-            guard rir != 0 else { continue }
+            guard rir != 0 || rdtr != 0 else { continue }
             let rawBus = UInt8((rdtr >> 4) & 0xFF)
             let isTxReceipt = (rawBus & 0x80) != 0
             if isTxReceipt && !includeTxEcho {

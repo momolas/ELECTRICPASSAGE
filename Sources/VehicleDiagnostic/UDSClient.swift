@@ -80,11 +80,12 @@ public actor UDSClient {
 
     @discardableResult
     public func startSession(sessionType: UInt8, keepAlive: Bool = true) async throws -> String {
+        stopTesterPresent()
         let hexCmd = String(format: "10%02X", sessionType)
         let response = try await sendRaw(hexCmd)
         try validatePositiveResponse(response, expectedSID: 0x10)
 
-        if keepAlive && sessionType != 0x01 {
+        if keepAlive && sessionType != 0x01 && !Task.isCancelled {
             startTesterPresentLoop()
         } else {
             stopTesterPresent()
@@ -143,7 +144,7 @@ public actor UDSClient {
 
     public func withAtomicTransaction<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
         atomicTransactionDepth += 1
-        defer { atomicTransactionDepth -= 1 }
+        defer { atomicTransactionDepth = max(0, atomicTransactionDepth - 1) }
         return try await operation()
     }
 
@@ -153,12 +154,15 @@ public actor UDSClient {
         level: UInt8,
         keyCalculation: @Sendable (String) async throws -> String
     ) async throws {
+        guard level >= 1 && level < 0xFF else {
+            throw UDSError.invalidResponseFormat("Niveau SecurityAccess invalide: 0x\(String(format: "%02X", level))")
+        }
         atomicTransactionDepth += 1
-        defer { atomicTransactionDepth -= 1 }
+        defer { atomicTransactionDepth = max(0, atomicTransactionDepth - 1) }
 
         // 1. Request Seed (27 + Odd Subfunction)
         let requestLevel = level % 2 == 0 ? level - 1 : level
-        guard requestLevel < 0xFF else {
+        guard requestLevel >= 1 && requestLevel < 0xFF else {
             throw UDSError.invalidResponseFormat("Niveau SecurityAccess invalide: 0x\(String(format: "%02X", level))")
         }
         let seedCmd = String(format: "27%02X", requestLevel)
@@ -219,7 +223,12 @@ public actor UDSClient {
     /// Effacement d'une plage mémoire Flash via RoutineControl (0x31 01 FF00).
     @discardableResult
     public func eraseMemory(memoryAddress: UInt32, memorySize: UInt32, addressAndLengthFormatIdentifier: UInt8 = 0x44) async throws -> String {
-        let options = String(format: "%02X%08X%08X", addressAndLengthFormatIdentifier, memoryAddress, memorySize)
+        let (addrHex, sizeHex) = try Self.encodeAddressAndLength(
+            address: memoryAddress,
+            size: memorySize,
+            alfid: addressAndLengthFormatIdentifier
+        )
+        let options = String(format: "%02X%@%@", addressAndLengthFormatIdentifier, addrHex, sizeHex)
         return try await startRoutine(routineType: 0x01, routineId: 0xFF00, optionHex: options)
     }
 
@@ -238,18 +247,11 @@ public actor UDSClient {
         memorySize: UInt16,
         addressAndLengthFormatIdentifier: UInt8 = 0x24
     ) async throws -> Data {
-        let addrBytes = Int(addressAndLengthFormatIdentifier & 0x0F)
-        let sizeBytes = Int((addressAndLengthFormatIdentifier >> 4) & 0x0F)
-        let addrHex: String
-        switch addrBytes {
-        case 3: addrHex = String(format: "%06X", memoryAddress & 0xFFFFFF)
-        default: addrHex = String(format: "%08X", memoryAddress)
-        }
-        let sizeHex: String
-        switch sizeBytes {
-        case 1: sizeHex = String(format: "%02X", memorySize & 0xFF)
-        default: sizeHex = String(format: "%04X", memorySize)
-        }
+        let (addrHex, sizeHex) = try Self.encodeAddressAndLength(
+            address: memoryAddress,
+            size: UInt32(memorySize),
+            alfid: addressAndLengthFormatIdentifier
+        )
         let hexCmd = String(format: "23%02X%@%@", addressAndLengthFormatIdentifier, addrHex, sizeHex)
         let response = try await sendRaw(hexCmd, timeout: 4.0)
         try validatePositiveResponse(response, expectedSID: 0x23)
@@ -266,12 +268,17 @@ public actor UDSClient {
         dataFormatIdentifier: UInt8 = 0x00,
         addressAndLengthFormatIdentifier: UInt8 = 0x44
     ) async throws -> Int {
+        let (addrHex, sizeHex) = try Self.encodeAddressAndLength(
+            address: memoryAddress,
+            size: uncompressedSize,
+            alfid: addressAndLengthFormatIdentifier
+        )
         let hexCmd = String(
-            format: "34%02X%02X%08X%08X",
+            format: "34%02X%02X%@%@",
             dataFormatIdentifier,
             addressAndLengthFormatIdentifier,
-            memoryAddress,
-            uncompressedSize
+            addrHex,
+            sizeHex
         )
         let response = try await sendRaw(hexCmd, timeout: 4.0)
         try validatePositiveResponse(response, expectedSID: 0x34)
@@ -286,12 +293,17 @@ public actor UDSClient {
         dataFormatIdentifier: UInt8 = 0x00,
         addressAndLengthFormatIdentifier: UInt8 = 0x44
     ) async throws -> Int {
+        let (addrHex, sizeHex) = try Self.encodeAddressAndLength(
+            address: memoryAddress,
+            size: uncompressedSize,
+            alfid: addressAndLengthFormatIdentifier
+        )
         let hexCmd = String(
-            format: "35%02X%02X%08X%08X",
+            format: "35%02X%02X%@%@",
             dataFormatIdentifier,
             addressAndLengthFormatIdentifier,
-            memoryAddress,
-            uncompressedSize
+            addrHex,
+            sizeHex
         )
         let response = try await sendRaw(hexCmd, timeout: 4.0)
         try validatePositiveResponse(response, expectedSID: 0x35)
@@ -309,16 +321,17 @@ public actor UDSClient {
         let response = try await sendRaw(hexCmd, timeout: 5.0)
         try validatePositiveResponse(response, expectedSID: 0x36)
 
-        // Réponse 76 [BSC] [Données optionnelles] ou 76 [Données]
+        // En UDS ISO 14229-1 (Service 0x36), la réponse positive 0x76 doit obligatoirement faire écho au BSC : 76 [BSC] [Data...]
         let afterSID = String(response.dropFirst(2))
         let bscHex = String(format: "%02X", blockSequenceCounter)
-        let dataHex: String
-        if afterSID.hasPrefix(bscHex) {
-            dataHex = String(afterSID.dropFirst(2))
-        } else {
-            dataHex = afterSID
+        guard afterSID.hasPrefix(bscHex) else {
+            throw UDSError.invalidResponseFormat("Écho BlockSequenceCounter invalide (attendu: 76\(bscHex)..., reçu: \(response))")
         }
-        return Data(HexParsing.bytes(dataHex) ?? [])
+        let dataHex = String(afterSID.dropFirst(2))
+        guard let decoded = HexParsing.bytes(dataHex) else {
+            throw UDSError.invalidResponseFormat("Payload TransferData non hexadécimal: \(dataHex)")
+        }
+        return Data(decoded)
     }
 
     /// Sortie du mode de transfert de blocs (Service 0x37 - RequestTransferExit).
@@ -331,18 +344,47 @@ public actor UDSClient {
         return response
     }
 
+    private static func encodeAddressAndLength(
+        address: UInt32,
+        size: UInt32,
+        alfid: UInt8
+    ) throws -> (addrHex: String, sizeHex: String) {
+        let addrBytes = Int(alfid & 0x0F)
+        let sizeBytes = Int((alfid >> 4) & 0x0F)
+        guard (1...4).contains(addrBytes), (1...4).contains(sizeBytes) else {
+            throw UDSError.invalidResponseFormat("ALFID hors bornes (1..4 octets requis): 0x\(String(format: "%02X", alfid))")
+        }
+        let addrHex: String
+        switch addrBytes {
+        case 1: addrHex = String(format: "%02X", address & 0xFF)
+        case 2: addrHex = String(format: "%04X", address & 0xFFFF)
+        case 3: addrHex = String(format: "%06X", address & 0xFFFFFF)
+        default: addrHex = String(format: "%08X", address)
+        }
+        let sizeHex: String
+        switch sizeBytes {
+        case 1: sizeHex = String(format: "%02X", size & 0xFF)
+        case 2: sizeHex = String(format: "%04X", size & 0xFFFF)
+        case 3: sizeHex = String(format: "%06X", size & 0xFFFFFF)
+        default: sizeHex = String(format: "%08X", size)
+        }
+        return (addrHex, sizeHex)
+    }
+
     private static func parseMaxBlockLength(from responseHex: String, defaultLength: Int) -> Int {
         guard let bytes = HexParsing.bytes(responseHex), bytes.count >= 3 else {
             return defaultLength
         }
         let lfid = Int((bytes[1] >> 4) & 0x0F)
-        let lengthCount = lfid > 0 ? min(lfid, bytes.count - 2) : (bytes.count - 2)
-        guard lengthCount > 0 else { return defaultLength }
-        var value = 0
-        for i in 0..<lengthCount {
-            value = (value << 8) | Int(bytes[2 + i])
+        let availableBytes = bytes.count - 2
+        let requestedCount = lfid > 0 ? min(lfid, availableBytes) : availableBytes
+        guard requestedCount > 0 && requestedCount <= 4 else { return defaultLength }
+        var value: UInt64 = 0
+        for i in 0..<requestedCount {
+            value = (value << 8) | UInt64(bytes[2 + i])
         }
-        return value > 2 ? value : defaultLength
+        guard value > 2 else { return defaultLength }
+        return Int(min(value, 65536))
     }
 
     // MARK: - ControlDTCSetting (0x85)
@@ -375,9 +417,11 @@ public actor UDSClient {
     // MARK: - Raw Transfer Helpers
 
     private func sendRaw(_ hex: String, timeout: TimeInterval = 2.0) async throws -> String {
+        atomicTransactionDepth += 1
+        defer { atomicTransactionDepth = max(0, atomicTransactionDepth - 1) }
         do {
             let res = try await interface.sendDiagnosticRequest(hex, timeout: timeout)
-            var clean = res
+            var clean = HexParsing.stripISOTPFraming(res)
                 .replacing(" ", with: "")
                 .replacing("\n", with: "")
                 .replacing("\r", with: "")
@@ -391,13 +435,15 @@ public actor UDSClient {
                 }
             }
             return clean
+        } catch let cancelErr as CancellationError {
+            throw cancelErr
         } catch {
             throw UDSError.transportError(error.localizedDescription)
         }
     }
 
     private func validatePositiveResponse(_ responseHex: String, expectedSID: UInt8) throws {
-        var clean = responseHex
+        var clean = HexParsing.stripISOTPFraming(responseHex)
             .replacing(" ", with: "")
             .replacing("\n", with: "")
             .replacing("\r", with: "")
