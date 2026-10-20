@@ -1946,4 +1946,174 @@ struct VehicleKitTests {
         #expect(mode06Results.first?.maxLimit == 50.0)
         #expect(mode06Results.first?.isPassed == true)
     }
+
+    @Test("CANBusFingerprinter Passive c0f Identification & Chassis Matching")
+    func testCANBusFingerprinterC0F() {
+        // 1. Dynamic DLC bus (Craig Smith Ch. 11 p. 308-309: 0x143 [4B] @ 10ms, 0x158 [8B] @ 10ms, 0x320 [3B] @ 100ms)
+        var dynamicFrames: [CANSampleFrame] = []
+        for i in 0..<20 {
+            let tBase = Double(i) * 0.010
+            dynamicFrames.append(CANSampleFrame(canID: 0x143, payload: [0x10, 0x20, 0x30, 0x40], timestampSeconds: tBase))
+            dynamicFrames.append(CANSampleFrame(canID: 0x158, payload: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08], timestampSeconds: tBase + 0.0002))
+            if i % 10 == 0 {
+                dynamicFrames.append(CANSampleFrame(canID: 0x320, payload: [0xAA, 0xBB, 0xCC], timestampSeconds: tBase + 0.0005))
+            }
+        }
+
+        let dynFP = CANBusFingerprinter.fingerprint(frames: dynamicFrames)
+        #expect(dynFP.isDynamicDLC == true)
+        #expect(dynFP.paddingByte == nil)
+        #expect(dynFP.commonIDs == [0x143, 0x158])
+        #expect(dynFP.mainID == 0x143)
+        #expect(abs((dynFP.mainIntervalSeconds ?? 0.0) - 0.010) < 0.0005)
+
+        // 2. Fixed 8-byte bus padded with 0xAA
+        var paddedFrames: [CANSampleFrame] = []
+        for i in 0..<15 {
+            let tBase = Double(i) * 0.020
+            paddedFrames.append(CANSampleFrame(canID: 0x201, payload: [0x12, 0x34, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA], timestampSeconds: tBase))
+            paddedFrames.append(CANSampleFrame(canID: 0x205, payload: [0x56, 0x78, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA], timestampSeconds: tBase + 0.0001))
+        }
+
+        let padFP = CANBusFingerprinter.fingerprint(frames: paddedFrames)
+        #expect(padFP.isDynamicDLC == false)
+        #expect(padFP.paddingByte == 0xAA)
+        #expect(padFP.commonIDs == [0x201, 0x205])
+
+        // 3. Database profile matching
+        let db = [
+            KnownChassisFingerprint(make: "Honda", model: "Civic", platformCode: "FK8", referenceFingerprint: dynFP),
+            KnownChassisFingerprint(make: "Renault", model: "Mégane II", platformCode: "JM0G", referenceFingerprint: padFP)
+        ]
+        let matched = CANBusFingerprinter.matchProfile(fingerprint: dynFP, database: db)
+        #expect(matched?.profile.make == "Honda")
+        #expect((matched?.score ?? 0.0) > 0.95)
+        #expect(CANBusFingerprinter.similarity(between: dynFP, and: padFP) < 0.30)
+    }
+
+    @Test("AutomotiveRiskAssessor HEAVENS Matrix, ISO/SAE 21434 & DREAD Scoring")
+    func testAutomotiveRiskAssessorHEAVENSAndDREAD() {
+        // 1. Direct HEAVENS Matrix verification (Alissa Knight Ch. 8 Table 8.11)
+        #expect(AutomotiveRiskAssessor.evaluateHEAVENSMatrix(threat: .none, impact: .critical) == .qm)
+        #expect(AutomotiveRiskAssessor.evaluateHEAVENSMatrix(threat: .low, impact: .low) == .low)
+        #expect(AutomotiveRiskAssessor.evaluateHEAVENSMatrix(threat: .medium, impact: .medium) == .medium)
+        #expect(AutomotiveRiskAssessor.evaluateHEAVENSMatrix(threat: .medium, impact: .high) == .high)
+        #expect(AutomotiveRiskAssessor.evaluateHEAVENSMatrix(threat: .high, impact: .critical) == .critical)
+
+        // 2. Vulnerable Safety-Critical ECU (unlocked 0x27, programming allowed in motion, no gateway isolation)
+        let vulnerableObs = ECUSecurityObservations(
+            ecuName: "ECM Bosch EDC16C3",
+            isSafetyCriticalDomain: true,
+            securityAccessUnlockedByDefault: true,
+            staticSeedDetected: true,
+            programmingSessionAllowedInMotion: true,
+            gatewayIsolationPresent: false,
+            busAnomalyScore: 0.75
+        )
+        let critReport = AutomotiveRiskAssessor.evaluateECUPosture(vulnerableObs)
+        #expect(critReport.threatLevel == .critical)
+        #expect(critReport.impactLevel == .critical)
+        #expect(critReport.securityLevel == .critical)
+        #expect(critReport.dreadScore >= 8.5)
+        #expect(critReport.strideCategories.contains(.elevationOfPrivilege))
+        #expect(critReport.strideCategories.contains(.tampering))
+        #expect(critReport.findings.count == 5)
+
+        // 3. Hardened Non-Safety ECU
+        let hardenedObs = ECUSecurityObservations(
+            ecuName: "Infotainment Head Unit",
+            isSafetyCriticalDomain: false,
+            securityAccessUnlockedByDefault: false,
+            staticSeedDetected: false,
+            programmingSessionAllowedInMotion: false,
+            gatewayIsolationPresent: true,
+            busAnomalyScore: 0.0
+        )
+        let lowReport = AutomotiveRiskAssessor.evaluateECUPosture(hardenedObs)
+        #expect(lowReport.securityLevel == .qm)
+        #expect(lowReport.findings.isEmpty)
+        #expect(lowReport.dreadScore < 3.0)
+    }
+
+    @Test("UDSSecurityScanner Session Enumeration, Service Discovery & Seed Audit")
+    func testUDSSecurityScanner() async throws {
+        let sim = SimulatorEngine()
+        let scanner = UDSSecurityScanner(interface: sim)
+
+        // 1. Sessions 0x01, 0x02, 0x03 supported on SimulatorEngine
+        let sessions = try await scanner.probeSessions(candidates: [0x01, 0x02, 0x03])
+        #expect(sessions.count == 3)
+        #expect(sessions.allSatisfy { $0.isSupported })
+
+        // 2. Service discovery
+        let services = try await scanner.probeServices(serviceIDs: [0x10, 0x22, 0x27, 0x3E, 0xAA])
+        let byID = Dictionary(uniqueKeysWithValues: services.map { ($0.serviceID, $0) })
+        #expect(byID[0x10]?.availability == .supported)
+        #expect(byID[0x22]?.availability == .supported)
+        #expect(byID[0x27]?.availability == .supported)
+        #expect(byID[0xAA]?.availability == .unsupported)
+
+        // 3. Static seed detection on level 0x01 vs Dynamic seed on level 0x05
+        let auditStatic = try await scanner.auditSecurityAccessSeed(level: 0x01)
+        #expect(auditStatic.posture == .staticSeedVulnerability)
+        #expect(auditStatic.firstSeed == [0x12, 0x34])
+        #expect(auditStatic.secondSeed == [0x12, 0x34])
+
+        let auditDynamic = try await scanner.auditSecurityAccessSeed(level: 0x05)
+        #expect(auditDynamic.posture == .dynamicSeedNominal)
+        #expect(auditDynamic.firstSeed != auditDynamic.secondSeed)
+        #expect(auditDynamic.shannonEntropyBitsPerByte > 1.0)
+
+        // 4. Unlocked-by-default (0x0000) and NRC 0x37 lockout via mock driver
+        actor MockSecDriver: VehicleInterface {
+            func setTarget(txID: String, rxID: String?) async throws {}
+            func sendDiagnosticRequest(_ requestHex: String, timeout: TimeInterval) async throws -> String {
+                if requestHex == "2701" { return "67 01 00 00" }
+                if requestHex == "2703" { return "7F 27 37" }
+                return "7F 27 12"
+            }
+        }
+        let mockScanner = UDSSecurityScanner(interface: MockSecDriver())
+        let unlockedAudit = try await mockScanner.auditSecurityAccessSeed(level: 0x01)
+        #expect(unlockedAudit.posture == .unlockedByDefault)
+        let lockedOutAudit = try await mockScanner.auditSecurityAccessSeed(level: 0x03)
+        #expect(lockedOutAudit.posture == .lockedOutTimeDelay)
+        #expect(lockedOutAudit.negativeResponseCode == 0x37)
+    }
+
+    @Test("EDRCrashDecoder SAE J1698 / UDS 0x19 04 Snapshot & OBD-II Mode 02 Freeze Frame")
+    func testEDRCrashDecoder() async throws {
+        // 1. Direct UDS 0x59 0x04 decoding with severe airbag deployment (B0001, 90 km/h, 3200 RPM, DeltaVx = -32 km/h, DeltaVy = +6 km/h, flags = 0x07)
+        let udsHex = "59 04 80 01 00 2F 01 5A 32 00 80 07 E0 06 8A"
+        let udsSnap = try #require(EDRCrashDecoder.decodeUDSSnapshot(from: udsHex))
+        #expect(udsSnap.triggerDTC == "B0001")
+        #expect(udsSnap.vehicleSpeedKmh == 90.0)
+        #expect(udsSnap.engineRPM == 3200.0)
+        #expect(udsSnap.brakeSwitchActive == true)
+        #expect(udsSnap.seatbeltBuckled == true)
+        #expect(udsSnap.airbagDeployed == true)
+        #expect(udsSnap.longitudinalDeltaVKmh == -32.0)
+        #expect(udsSnap.lateralDeltaVKmh == 6.0)
+        #expect(abs(udsSnap.batteryVoltage - 13.8) < 0.01)
+        #expect(udsSnap.severity == .severeAirbagDeployment)
+        #expect(udsSnap.dissipatedKineticEnergyKJ(vehicleMassKg: 1500.0) > 55.0)
+
+        // 2. OBD-II Mode 02 Freeze Frame decoding
+        let obd2Hex = "42 02 00 01 02 0C 00 0B B8 0D 00 32 11 00 FF 42 00 37 14"
+        let obdSnap = try #require(EDRCrashDecoder.decodeOBD2FreezeFrame(from: obd2Hex))
+        #expect(obdSnap.triggerDTC == "P0102")
+        #expect(obdSnap.engineRPM == 750.0)
+        #expect(obdSnap.vehicleSpeedKmh == 50.0)
+        #expect(abs(obdSnap.throttlePositionPercent - 100.0) < 0.01)
+        #expect(abs(obdSnap.batteryVoltage - 14.1) < 0.01)
+
+        // 3. Live query via SimulatorEngine
+        let sim = SimulatorEngine()
+        let liveSnap = try #require(await EDRCrashDecoder.readCrashSnapshot(using: sim))
+        #expect(liveSnap.triggerDTC == "P0102")
+        #expect(liveSnap.vehicleSpeedKmh == 50.0)
+        #expect(liveSnap.longitudinalDeltaVKmh == -18.0)
+        #expect(liveSnap.severity == .moderate)
+    }
 }
+

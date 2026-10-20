@@ -28,6 +28,7 @@ public actor SimulatorEngine: VehicleInterface {
     private var currentTx: String = "7E0"
     private var currentRx: String = "7E8"
     private var state = EnginePhysicsState()
+    private var dynamicSeedCounter: UInt16 = 0x9A3C
 
     public init() {}
 
@@ -123,16 +124,19 @@ public actor SimulatorEngine: VehicleInterface {
 
         // 1. Session request (10)
         if clean.hasPrefix("10") {
+            guard clean.count >= 4 else { return "7F1013" }
             return "50" + clean.dropFirst(2) + "003201F4"
         }
 
         // 2. ECU Reset (11)
         if clean.hasPrefix("11") {
+            guard clean.count >= 4 else { return "7F1113" }
             return "51" + clean.dropFirst(2)
         }
 
         // 3. Clear DTCs UDS/KWP (14) & OBD-II Mode 04 (04)
         if clean.hasPrefix("14") {
+            guard clean.count >= 4 else { return "7F1413" }
             clearFaults()
             return "54"
         }
@@ -141,8 +145,31 @@ public actor SimulatorEngine: VehicleInterface {
             return "44"
         }
 
-        // 4. Read DTC Info UDS (19), KWP2000 (18) & OBD-II Mode 03/07/0A
+        // 4. Read DTC Info UDS (19), KWP2000 (18) & OBD-II Mode 02/03/07/0A
+        if clean.hasPrefix("1904") {
+            let dtc = state.activeDTCs.first ?? "B0001"
+            let dtcBytes = encodeDTC(dtc)
+            let speedByte = UInt8(min(255.0, max(0.0, state.speedKmh)))
+            let rpmRaw = UInt16(min(65535.0, max(0.0, state.rpm * 4.0)))
+            let throttleByte = UInt8(min(255.0, max(0.0, (state.throttlePercent / 100.0) * 255.0)))
+            let flags: UInt8 = 0x03 // Brake active (0x01) + Seatbelt buckled (0x02)
+            let deltaVxByte = UInt8(bitPattern: Int8(-18)) // -18 km/h choc longitudinal modéré
+            let deltaVyByte = UInt8(bitPattern: Int8(3))
+            let voltByte = UInt8(min(255.0, max(0.0, state.batteryVoltage * 10.0)))
+            return String(
+                format: "59 04 %02X %02X 00 2F 01 %02X %02X %02X %02X %02X %02X %02X %02X",
+                dtcBytes[0], dtcBytes[1],
+                speedByte,
+                (rpmRaw >> 8) & 0xFF, rpmRaw & 0xFF,
+                throttleByte,
+                flags,
+                deltaVxByte,
+                deltaVyByte,
+                voltByte
+            )
+        }
         if clean.hasPrefix("19") {
+            guard clean.count >= 4 else { return "7F1913" }
             if state.activeDTCs.isEmpty {
                 return "5902FF"
             }
@@ -156,6 +183,18 @@ public actor SimulatorEngine: VehicleInterface {
                 }
             }
             return pieces
+        }
+        if clean.hasPrefix("02") {
+            let dtc = state.activeDTCs.first ?? "P0102"
+            let dtcBytes = encodeDTC(dtc)
+            let rpmRaw = UInt16(min(65535.0, max(0.0, state.rpm * 4.0)))
+            let speedByte = UInt8(min(255.0, max(0.0, state.speedKmh)))
+            return String(
+                format: "42 02 00 %02X %02X 0C 00 %02X %02X 0D 00 %02X",
+                dtcBytes[0], dtcBytes[1],
+                (rpmRaw >> 8) & 0xFF, rpmRaw & 0xFF,
+                speedByte
+            )
         }
         if clean.hasPrefix("18") {
             if state.activeDTCs.isEmpty {
@@ -204,6 +243,7 @@ public actor SimulatorEngine: VehicleInterface {
 
         // 6. Read Data By Identifier UDS (22)
         if clean.hasPrefix("22") {
+            guard clean.count >= 6 else { return "7F2213" }
             let did = String(clean.dropFirst(2).prefix(4))
             switch did {
             case "F190":
@@ -223,9 +263,13 @@ public actor SimulatorEngine: VehicleInterface {
 
         // 7. SecurityAccess (27)
         if clean.hasPrefix("27") {
+            guard clean.count >= 4 else { return "7F2713" }
             let subFn = String(clean.dropFirst(2).prefix(2))
-            if subFn == "01" || subFn == "03" || subFn == "05" {
-                return "67" + subFn + "1234" // Mock Seed
+            if subFn == "01" || subFn == "03" {
+                return "67" + subFn + "1234" // Mock Static Seed
+            } else if subFn == "05" {
+                dynamicSeedCounter = dynamicSeedCounter &+ 0x37A9
+                return String(format: "6705%04X", dynamicSeedCounter) // Mock Dynamic Seed
             } else {
                 return "67" + subFn // Key accepted
             }
