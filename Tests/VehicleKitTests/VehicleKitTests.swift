@@ -2115,5 +2115,137 @@ struct VehicleKitTests {
         #expect(liveSnap.longitudinalDeltaVKmh == -18.0)
         #expect(liveSnap.severity == .moderate)
     }
+
+    @Test("CANDifferentialReverser Differential Bit-Flip Isolation, 16-bit Big-Endian Regression & Vector .dbc Synthesis")
+    func testCANDifferentialReverserAndDBCSynthesizer() throws {
+        // 1. Differential Bit-Flip Isolation: Brake switch on CAN ID 0x244 byte 4 bit 2 (mask 0x04), with rolling counter on byte 7
+        var baselineFrames: [CANSampleFrame] = []
+        var stimulusFrames: [CANSampleFrame] = []
+        for i in 0..<30 {
+            let counter = UInt8(i % 16)
+            let analogSensor = UInt8((i * 7) % 200)
+            baselineFrames.append(
+                CANSampleFrame(
+                    canID: 0x244,
+                    payload: [analogSensor, 0x10, 0x00, 0x80, 0x00, 0x00, 0x00, counter],
+                    timestampSeconds: Double(i) * 0.02
+                )
+            )
+            stimulusFrames.append(
+                CANSampleFrame(
+                    canID: 0x244,
+                    payload: [analogSensor, 0x10, 0x00, 0x80, 0x04, 0x00, 0x00, counter],
+                    timestampSeconds: Double(i) * 0.02
+                )
+            )
+        }
+
+        let bitCandidates = CANDifferentialReverser.isolateBitTransitions(
+            baselineFrames: baselineFrames,
+            stimulusFrames: stimulusFrames
+        )
+        #expect(bitCandidates.count == 1)
+        let brakeBit = try #require(bitCandidates.first)
+        #expect(brakeBit.canID == 0x244)
+        #expect(brakeBit.byteIndex == 4)
+        #expect(brakeBit.bitIndex == 2)
+        #expect(brakeBit.bitMask == 0x04)
+        #expect(brakeBit.baselineBitValue == 0)
+        #expect(brakeBit.stimulusBitValue == 1)
+        #expect(brakeBit.confidence >= 0.99)
+
+        // 2. Automated 16-bit Motorola Big-Endian Signal Regression: y = 0.25 * rawBE16 - 10.0 on CAN ID 0x130 bytes 2..3
+        var streamFrames: [CANSampleFrame] = []
+        var refSamples: [CANReferenceSample] = []
+        for i in 0..<40 {
+            let t = Double(i) * 0.05
+            let raw16 = UInt16(400 + i * 180) // spans multiple MSB steps (400 to 7420)
+            let physicalSpeed = 0.25 * Double(raw16) - 10.0
+            let hi = UInt8((raw16 >> 8) & 0xFF)
+            let lo = UInt8(raw16 & 0xFF)
+            let counter = UInt8(i % 16)
+
+            streamFrames.append(
+                CANSampleFrame(
+                    canID: 0x130,
+                    payload: [0xAA, 0x55, hi, lo, 0x00, 0x00, 0x00, counter],
+                    timestampSeconds: t
+                )
+            )
+            refSamples.append(CANReferenceSample(timestampSeconds: t, physicalValue: physicalSpeed))
+        }
+
+        let discovered = CANDifferentialReverser.discoverAnalogSignals(
+            frames: streamFrames,
+            referenceSamples: refSamples,
+            signalName: "VehicleSpeed",
+            unit: "km/h"
+        )
+        let topSignal = try #require(discovered.first)
+        #expect(topSignal.canID == 0x130)
+        #expect(topSignal.startByte == 2)
+        #expect(topSignal.bitLength == 16)
+        #expect(topSignal.byteOrder == .motorolaBigEndian)
+        #expect(abs(topSignal.scale - 0.25) < 1e-4)
+        #expect(abs(topSignal.offset - (-10.0)) < 1e-3)
+        #expect(topSignal.rSquared > 0.999)
+
+        // 3. Vector .dbc Synthesis
+        let dbcContent = CANDifferentialReverser.synthesizeDBC(
+            analogSignals: [topSignal],
+            bitCandidates: [brakeBit],
+            busName: "CHASSIS_HS_CAN"
+        )
+        #expect(dbcContent.contains("VERSION \"CHASSIS_HS_CAN\""))
+        #expect(dbcContent.contains("BO_ 304 MSG_130: 8 Vector__XXX"))
+        #expect(dbcContent.contains("SG_ VehicleSpeed : 23|16@0+ (0.25,-10)"))
+        #expect(dbcContent.contains("BO_ 580 MSG_244: 8 Vector__XXX"))
+        #expect(dbcContent.contains("SG_ STATE_244_B4_BIT2 : 34|1@1+ (1,0) [0|1] \"flag\" Vector__XXX"))
+    }
+
+    @Test("VehicleForensicOrchestrator End-to-End ISO/SAE 21434 Dossier & FNV-1a64 Seal")
+    func testVehicleForensicOrchestratorEndToEnd() async throws {
+        let sim = SimulatorEngine()
+        let orchestrator = VehicleForensicOrchestrator(interface: sim)
+
+        var canFrames: [CANSampleFrame] = []
+        for i in 0..<30 {
+            let t = Double(i) * 0.01
+            canFrames.append(CANSampleFrame(canID: 0x0C8, payload: [0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x00], timestampSeconds: t))
+            if i % 2 == 0 {
+                canFrames.append(CANSampleFrame(canID: 0x1A0, payload: [0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00], timestampSeconds: t + 0.002))
+            }
+        }
+
+        let dossier = try await orchestrator.collectDossier(
+            ecuName: "PCM_POWERTRAIN_0x7E0",
+            isSafetyCriticalDomain: true,
+            gatewayIsolationPresent: true,
+            capturedCANFrames: canFrames
+        )
+
+        #expect(dossier.ecuName == "PCM_POWERTRAIN_0x7E0")
+        #expect(dossier.verifyIntegrity() == true)
+        #expect(dossier.evidenceDigestHex.count == 16)
+        #expect(dossier.udsScanReport.seedAudits.contains { $0.posture == .staticSeedVulnerability })
+        #expect(dossier.edrCrashSnapshot?.triggerDTC == "P0102")
+        #expect(dossier.canFingerprint?.mainID == 0x0C8)
+        #expect(dossier.busAnomalyReport != nil)
+        #expect(dossier.riskReport.securityLevel >= .high)
+
+        // Tamper verification check: modifying the digest invalidates verifyIntegrity()
+        let tamperedDossier = VehicleForensicDossier(
+            ecuName: dossier.ecuName,
+            udsScanReport: dossier.udsScanReport,
+            calibrationInfo: dossier.calibrationInfo,
+            edrCrashSnapshot: dossier.edrCrashSnapshot,
+            canFingerprint: dossier.canFingerprint,
+            busAnomalyReport: dossier.busAnomalyReport,
+            riskReport: dossier.riskReport,
+            evidenceDigestHex: "0000000000000000"
+        )
+        #expect(tamperedDossier.verifyIntegrity() == false)
+    }
 }
+
 

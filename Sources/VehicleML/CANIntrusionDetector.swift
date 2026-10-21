@@ -2,7 +2,7 @@ import Foundation
 import VehicleCore
 
 /// Rapport d'anomalie et d'évaluation de la sécurité du bus CAN
-public struct BusAnomalyReport: Sendable, Equatable {
+public struct BusAnomalyReport: Sendable, Equatable, Codable {
     public enum BusSecurityStatus: String, Sendable, Codable {
         case nominal = "Nominal (Trafic Sain)"
         case suspiciousJitter = "Gigue Anormale Détectée"
@@ -38,7 +38,7 @@ public struct BusAnomalyReport: Sendable, Equatable {
 }
 
 /// Trame CAN brute pour l'analyse de flux IDS
-public struct CANSampleFrame: Sendable {
+public struct CANSampleFrame: Sendable, Equatable, Codable {
     public let canID: UInt32
     public let payload: [UInt8]
     public let timestampSeconds: Double

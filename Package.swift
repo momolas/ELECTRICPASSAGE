@@ -60,7 +60,7 @@ let package = Package(
         ),
         .target(
             name: "VehicleML",
-            dependencies: ["VehicleCore", "VehicleAnalytics"],
+            dependencies: ["VehicleCore", "VehicleAnalytics", "VehicleDiagnostic", "VehicleTransport"],
             path: "Sources/VehicleML"
         ),
         .target(
