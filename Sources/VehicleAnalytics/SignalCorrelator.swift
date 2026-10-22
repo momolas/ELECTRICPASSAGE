@@ -2,7 +2,7 @@ import Foundation
 import VehicleCore
 
 /// Représente le résultat d'une corrélation sur une tranche de données hexadécimales.
-public struct SliceCorrelation: Identifiable, Equatable, Hashable, Sendable {
+public struct SliceCorrelation: Identifiable, Equatable, Hashable, Sendable, Codable {
     public let id: UUID
     public let sliceName: String
     public let referenceSignal: String

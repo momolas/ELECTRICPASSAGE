@@ -86,13 +86,18 @@ public nonisolated struct ECUCalibrationInfo: Sendable, Equatable, Codable {
 public enum CalibrationReader: Sendable {
 
     /// Interroge le calculateur moteur pour extraire les identifiants de calibration (OBD-II Mode 09, UDS 0x22, KWP2000 0x2180).
-    public static func read(interface: VehicleInterface) async throws -> ECUCalibrationInfo? {
+    public static func read(
+        interface: VehicleInterface,
+        overrideTargetToStandardOBD: Bool = true
+    ) async throws -> ECUCalibrationInfo? {
         try Task.checkCancellation()
 
         // 1. Stage A : OBD-II Standard Mode 09 (PID 04 CalID + PID 06 CVN sur 0x7E0 -> 0x7E8)
         do {
             try Task.checkCancellation()
-            try await interface.setTarget(txID: "7E0", rxID: "7E8")
+            if overrideTargetToStandardOBD {
+                try await interface.setTarget(txID: "7E0", rxID: "7E8")
+            }
             let rawCal = try? await interface.sendDiagnosticRequest("0904", timeout: 2.0)
             try Task.checkCancellation()
             let calIDs = rawCal.map(parseOBD2CalID) ?? []
@@ -117,7 +122,9 @@ public enum CalibrationReader: Sendable {
         // 2. Stage B : UDS ISO 14229 Service 0x22 (DID F198 / F182 CalID, F188 SW, F191 HW)
         do {
             try Task.checkCancellation()
-            try await interface.setTarget(txID: "7E0", rxID: "7E8")
+            if overrideTargetToStandardOBD {
+                try await interface.setTarget(txID: "7E0", rxID: "7E8")
+            }
             let rawCal = try? await interface.sendDiagnosticRequest("22F198", timeout: 1.5)
             try Task.checkCancellation()
             var calID = rawCal.flatMap { parseUDSIdentifier($0, did: "F198") }
@@ -161,7 +168,9 @@ public enum CalibrationReader: Sendable {
         // 3. Stage C : Renault KWP2000 Service 21 LID 80 (Bloc d'identification constructeur 2180 sur 0x7E0 -> 0x7E8)
         do {
             try Task.checkCancellation()
-            try await interface.setTarget(txID: "7E0", rxID: "7E8")
+            if overrideTargetToStandardOBD {
+                try await interface.setTarget(txID: "7E0", rxID: "7E8")
+            }
             _ = try await openDiagnosticSession(interface: interface)
             try Task.checkCancellation()
             if let raw2180 = try? await interface.sendDiagnosticRequest("2180", timeout: 2.0),

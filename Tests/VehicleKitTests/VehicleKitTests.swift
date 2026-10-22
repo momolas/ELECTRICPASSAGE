@@ -2246,6 +2246,210 @@ struct VehicleKitTests {
         )
         #expect(tamperedDossier.verifyIntegrity() == false)
     }
+
+    @Test("EDRCrashDecoder Mode 02 Preceding Standard PID, Trailing CAN Padding frameNumber Protection & Empty P0000 Rejection")
+    func testEDRCrashDecoderMode02EdgeCases() throws {
+        // 1. Preceding standard 1-byte PID 0x05 (Coolant Temp = 80°C -> 0x78) before PIDs 0x02, 0x0C, 0x0D
+        let multiPIDWithCoolant = "42 05 00 78 02 00 01 02 0C 00 0B B8 0D 00 32"
+        let snapFromMulti = try #require(EDRCrashDecoder.decodeOBD2FreezeFrame(from: multiPIDWithCoolant))
+        #expect(snapFromMulti.triggerDTC == "P0102")
+        #expect(snapFromMulti.engineRPM == 750.0)
+        #expect(snapFromMulti.vehicleSpeedKmh == 50.0)
+
+        // 2. Frame number 0x01 followed by 2 trailing CAN padding bytes (0xAA 0xAA) must preserve snapshotRecordNumber == 0x01
+        let paddedFrame01 = "42 02 01 01 02 0D 01 32 AA AA"
+        let snapPadded = try #require(EDRCrashDecoder.decodeOBD2FreezeFrame(from: paddedFrame01))
+        #expect(snapPadded.snapshotRecordNumber == 0x01)
+        #expect(snapPadded.vehicleSpeedKmh == 50.0)
+
+        // 3. Empty Mode 02 Freeze Frame (PID 0x02 == 0x0000 -> P0000 only) must return nil
+        let emptyFreezeFrame = "05 42 02 00 00 00 AA AA"
+        #expect(EDRCrashDecoder.decodeOBD2FreezeFrame(from: emptyFreezeFrame) == nil)
+    }
+
+    @Test("UDSSecurityScanner Sub-Function 0x01..0x7D Bounds, Padded 8-Byte CAN Single-Frame & Missing Second Seed Audit")
+    func testUDSSecurityScannerSeedAuditEdgeCases() async throws {
+        actor SeedEdgeCaseDriver: VehicleInterface {
+            private(set) var sentRequests: [String] = []
+            private var count2701 = 0
+
+            func setTarget(txID: String, rxID: String?) async throws {}
+            func sendDiagnosticRequest(_ requestHex: String, timeout: TimeInterval) async throws -> String {
+                sentRequests.append(requestHex)
+                if requestHex == "2701" {
+                    count2701 += 1
+                    // First request returns padded 8-byte CAN Single-Frame with constant 0xAAAA; second returns NRC 0x37
+                    return count2701 == 1 ? "04 67 01 AA AA 55 55 55" : "03 7F 27 37 55 55 55 55"
+                }
+                return "7F 27 12"
+            }
+        }
+
+        let driver = SeedEdgeCaseDriver()
+        let scanner = UDSSecurityScanner(interface: driver)
+
+        // 1. Even SendKey level (0x02), zero (0x00), reserved (0x7F), and suppressPosRsp bit (0x81) must not transmit
+        let evenAudit = try await scanner.auditSecurityAccessSeed(level: 0x02)
+        #expect(evenAudit.posture == .notSupported)
+        let reservedAudit = try await scanner.auditSecurityAccessSeed(level: 0x7F)
+        #expect(reservedAudit.posture == .notSupported)
+        let suppressBitAudit = try await scanner.auditSecurityAccessSeed(level: 0x81)
+        #expect(suppressBitAudit.posture == .notSupported)
+        #expect(await driver.sentRequests.isEmpty)
+
+        // 2. Padded 8-byte CAN Single-Frame + constant zero-entropy firstSeed [0xAA, 0xAA] when second seed fails
+        let singleSeedAudit = try await scanner.auditSecurityAccessSeed(level: 0x01)
+        #expect(singleSeedAudit.firstSeed == [0xAA, 0xAA])
+        #expect(singleSeedAudit.secondSeed == nil)
+        #expect(singleSeedAudit.shannonEntropyBitsPerByte == 0.0)
+        #expect(singleSeedAudit.posture == .staticSeedVulnerability)
+    }
+
+    @Test("VehicleForensicDossier Full Field Tamper Detection & Non-Finite Double Safety")
+    func testVehicleForensicDossierTamperAndNaNSafety() async throws {
+        let sim = SimulatorEngine()
+        let orchestrator = VehicleForensicOrchestrator(interface: sim)
+        let original = try await orchestrator.collectDossier(ecuName: "PCM_0x7E0")
+        #expect(original.verifyIntegrity() == true)
+
+        // 1. Tamper with forensic crash evidence while keeping triggerDTC and totalDeltaVMagnitudeKmh identical
+        let origEDR = try #require(original.edrCrashSnapshot)
+        let tamperedEDR = EDRCrashSnapshot(
+            triggerDTC: origEDR.triggerDTC,
+            snapshotRecordNumber: origEDR.snapshotRecordNumber,
+            vehicleSpeedKmh: 195.0,
+            engineRPM: 6500.0,
+            throttlePositionPercent: 100.0,
+            brakeSwitchActive: !origEDR.brakeSwitchActive,
+            seatbeltBuckled: !origEDR.seatbeltBuckled,
+            airbagDeployed: !origEDR.airbagDeployed,
+            longitudinalDeltaVKmh: -origEDR.longitudinalDeltaVKmh,
+            lateralDeltaVKmh: origEDR.lateralDeltaVKmh,
+            batteryVoltage: origEDR.batteryVoltage,
+            severity: .severeAirbagDeployment
+        )
+        let forgedDossier = VehicleForensicDossier(
+            ecuName: original.ecuName,
+            udsScanReport: original.udsScanReport,
+            calibrationInfo: original.calibrationInfo,
+            edrCrashSnapshot: tamperedEDR,
+            canFingerprint: original.canFingerprint,
+            busAnomalyReport: original.busAnomalyReport,
+            riskReport: original.riskReport,
+            evidenceDigestHex: original.evidenceDigestHex
+        )
+        #expect(forgedDossier.verifyIntegrity() == false)
+
+        // 2. Non-finite Double (.nan / .infinity) must not trap in computeDigestHex
+        let nanRisk = AutomotiveRiskReport(
+            targetName: "ECU",
+            threatLevel: .low,
+            impactLevel: .low,
+            securityLevel: .low,
+            dreadScore: .nan,
+            strideCategories: [],
+            findings: [],
+            remediations: []
+        )
+        let digest = VehicleForensicDossier.computeDigestHex(
+            ecuName: "ECU",
+            udsScanReport: original.udsScanReport,
+            calibrationInfo: nil,
+            edrCrashSnapshot: nil,
+            canFingerprint: nil,
+            busAnomalyReport: nil,
+            riskReport: nanRisk
+        )
+        #expect(digest.count == 16)
+    }
+
+    @Test("CANDifferentialReverser Out-of-Order Frame Counter Rejection, 29-Bit Extended DBC ID Flag & Low-Count c0f Self-Similarity")
+    func testCANDifferentialReverserUnsortedFramesAndExtendedDBC() {
+        // 1. Rolling counter 0..9 during a 10-sample ramp must be rejected even when frames arrive in reverse order
+        var chronologicalFrames: [CANSampleFrame] = []
+        var refs: [CANReferenceSample] = []
+        for i in 0..<10 {
+            let t = Double(i) * 0.05
+            let rollingCounter = UInt8(i)
+            chronologicalFrames.append(CANSampleFrame(canID: 0x200, payload: [rollingCounter], timestampSeconds: t))
+            refs.append(CANReferenceSample(timestampSeconds: t, physicalValue: Double(i) * 10.0))
+        }
+
+        let fromReversed = CANDifferentialReverser.discoverAnalogSignals(
+            frames: Array(chronologicalFrames.reversed()),
+            referenceSamples: refs,
+            signalName: "Speed",
+            unit: "km/h"
+        )
+        #expect(fromReversed.isEmpty)
+
+        // 2. 29-bit J1939 Extended CAN ID (0x0CF00400) must set bit 31 (0x8CF00400 = 2364540160) in Vector DBC
+        let extSignal = DiscoveredCANSignal(
+            name: "12V_EngineSpeed",
+            canID: 0x0CF00400,
+            dlc: 8,
+            startByte: 3,
+            bitLength: 16,
+            byteOrder: .intelLittleEndian,
+            scale: 0.125,
+            offset: 0.0,
+            minValue: 0.0,
+            maxValue: 8031.875,
+            unit: "rpm",
+            rSquared: 1.0
+        )
+        let dbc = CANDifferentialReverser.synthesizeDBC(analogSignals: [extSignal])
+        let expectedDBCID: UInt32 = 0x0CF00400 | 0x80000000
+        #expect(dbc.contains("BO_ \(expectedDBCID) MSG_0CF00400: 8 Vector__XXX"))
+        #expect(dbc.contains("SG_ SIG_12V_EngineSpeed :"))
+
+        // 3. Single-frame-per-ID c0f fingerprint self-similarity must equal 1.0
+        let singleShot = [
+            CANSampleFrame(canID: 0x100, payload: [0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], timestampSeconds: 0.01),
+            CANSampleFrame(canID: 0x200, payload: [0x03, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], timestampSeconds: 0.02)
+        ]
+        let fp = CANBusFingerprinter.fingerprint(frames: singleShot)
+        #expect(fp.commonIDs == [0x100, 0x200])
+        #expect(abs(CANBusFingerprinter.similarity(between: fp, and: fp) - 1.0) < 1e-6)
+    }
+
+    @Test("VehicleForensicOrchestrator Preserves Non-7E0 ECU Target Across CalibrationReader & EDRCrashDecoder")
+    func testVehicleForensicOrchestratorTargetPreservation() async throws {
+        actor TargetTrackingSRSInterface: VehicleInterface {
+            var currentTx: String = "752"
+            var currentRx: String = "772"
+            var edrQueriedTxID: String?
+
+            func setTarget(txID: String, rxID: String?) async throws {
+                self.currentTx = txID
+                self.currentRx = rxID ?? "772"
+            }
+
+            func sendDiagnosticRequest(_ requestHex: String, timeout: TimeInterval) async throws -> String {
+                let clean = requestHex.replacing(" ", with: "").uppercased()
+                if clean.hasPrefix("1904") {
+                    edrQueriedTxID = currentTx
+                    if currentTx == "752" {
+                        return "59 04 80 01 00 2F 01 5A 32 00 80 07 E0 06 8A"
+                    }
+                    return "7F 19 11"
+                }
+                if clean == "22F198" {
+                    return "62F1985352535F43414C5F3031"
+                }
+                return "7F" + String(clean.prefix(2)) + "11"
+            }
+        }
+
+        let srsInterface = TargetTrackingSRSInterface()
+        let orchestrator = VehicleForensicOrchestrator(interface: srsInterface)
+        let dossier = try await orchestrator.collectDossier(ecuName: "SRS_AIRBAG_0x752")
+
+        #expect(await srsInterface.edrQueriedTxID == "752")
+        #expect(dossier.edrCrashSnapshot?.triggerDTC == "B0001")
+        #expect(dossier.calibrationInfo?.primaryCalID == "SRS_CAL_01")
+    }
 }
+
 
 

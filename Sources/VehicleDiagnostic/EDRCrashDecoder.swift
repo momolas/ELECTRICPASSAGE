@@ -77,8 +77,7 @@ public enum EDRCrashDecoder {
     /// `59 04 <DTC_H> <DTC_M> <DTC_L> <DTC_Status> <RecordNum> <Speed> <RPM_H> <RPM_L> <Throttle> <Flags> <DeltaVx_Int8> <DeltaVy_Int8> <Voltage_0.1V>`
     /// - Flags bitmask : bit 0 = brakeSwitchActive, bit 1 = seatbeltBuckled, bit 2 = airbagDeployed
     public static func decodeUDSSnapshot(from responseHex: String) -> EDRCrashSnapshot? {
-        let stripped = HexParsing.stripISOTPFraming(responseHex)
-        let bytes = HexParsing.bytes(stripped) ?? []
+        let bytes = extractPDUBytes(from: responseHex)
         guard bytes.count >= 15, bytes[0] == 0x59, bytes[1] == 0x04 else {
             return nil
         }
@@ -128,9 +127,9 @@ public enum EDRCrashDecoder {
     /// - `0D` (Vitesse véhicule km/h, 1 octet `A`)
     /// - `11` (Position papillon %, 1 octet `A * 100 / 255`)
     /// - `42` (Tension module de contrôle V, 2 octets `(256*A + B)/1000`)
+    /// Ignore proprement les autres PIDs standards J1979 (1, 2 ou 4 octets) intercalés et les octets de bourrage CAN.
     public static func decodeOBD2FreezeFrame(from responseHex: String) -> EDRCrashSnapshot? {
-        let stripped = HexParsing.stripISOTPFraming(responseHex)
-        let bytes = HexParsing.bytes(stripped) ?? []
+        let bytes = extractPDUBytes(from: responseHex)
         guard bytes.count >= 4, bytes[0] == 0x42 else {
             return nil
         }
@@ -141,50 +140,59 @@ public enum EDRCrashDecoder {
         var rpm = 0.0
         var throttle = 0.0
         var voltage = 12.6
-        var parsedAny = false
+        var hasValidTriggerOrTelemetry = false
 
         var idx = 1
         while idx + 1 < bytes.count {
             let pid = bytes[idx]
             let frameNo = bytes[idx + 1]
-            frameNumber = frameNo
+
+            guard let dataLen = obd2Mode02PIDDataLength(pid: pid),
+                  idx + 2 + dataLen <= bytes.count else {
+                // Fin de trame ou octets de bourrage CAN (ex: 0xAA, 0xFF, 0x00) -> ne pas écraser frameNumber
+                break
+            }
+
             idx += 2
 
             switch pid {
             case 0x02:
-                guard idx + 1 < bytes.count else { break }
-                triggerDTC = DTCDecoder.decodeSingleDTC(String(format: "%02X%02X", bytes[idx], bytes[idx + 1])) ?? "P0000"
+                frameNumber = frameNo
+                let decoded = DTCDecoder.decodeSingleDTC(String(format: "%02X%02X", bytes[idx], bytes[idx + 1])) ?? "P0000"
+                triggerDTC = decoded
+                if decoded != "P0000" {
+                    hasValidTriggerOrTelemetry = true
+                }
                 idx += 2
-                parsedAny = true
             case 0x0C:
-                guard idx + 1 < bytes.count else { break }
+                frameNumber = frameNo
                 let raw = (UInt16(bytes[idx]) << 8) | UInt16(bytes[idx + 1])
                 rpm = Double(raw) / 4.0
                 idx += 2
-                parsedAny = true
+                hasValidTriggerOrTelemetry = true
             case 0x0D:
-                guard idx < bytes.count else { break }
+                frameNumber = frameNo
                 speedKmh = Double(bytes[idx])
                 idx += 1
-                parsedAny = true
+                hasValidTriggerOrTelemetry = true
             case 0x11:
-                guard idx < bytes.count else { break }
+                frameNumber = frameNo
                 throttle = (Double(bytes[idx]) * 100.0) / 255.0
                 idx += 1
-                parsedAny = true
+                hasValidTriggerOrTelemetry = true
             case 0x42:
-                guard idx + 1 < bytes.count else { break }
+                frameNumber = frameNo
                 let raw = (UInt16(bytes[idx]) << 8) | UInt16(bytes[idx + 1])
                 voltage = Double(raw) / 1000.0
                 idx += 2
-                parsedAny = true
+                hasValidTriggerOrTelemetry = true
             default:
-                // Fin d'analyse si PID inconnu de longueur variable
-                idx = bytes.count
+                // Saut propre d'un PID standard SAE J1979 intercalé (ex: 0x04 Charge, 0x05 Eau, 0x0B MAP)
+                idx += dataLen
             }
         }
 
-        guard parsedAny else { return nil }
+        guard hasValidTriggerOrTelemetry else { return nil }
 
         return EDRCrashSnapshot(
             triggerDTC: triggerDTC,
@@ -236,6 +244,43 @@ public enum EDRCrashDecoder {
             return .minor
         } else {
             return .none
+        }
+    }
+
+    // MARK: - Private Helpers
+
+    private static func extractPDUBytes(from raw: String) -> [UInt8] {
+        let stripped = HexParsing.stripISOTPFraming(raw)
+        var bytes = HexParsing.bytes(stripped) ?? []
+        if bytes.count >= 2 && bytes[0] >= 0x01 && bytes[0] <= 0x07 {
+            let pciLen = Int(bytes[0])
+            let nextByte = bytes[1]
+            if pciLen == bytes.count - 1 {
+                bytes.removeFirst()
+            } else if bytes.count == 8 && pciLen < 7 && (nextByte == 0x59 || nextByte == 0x42 || nextByte == 0x7F) {
+                bytes = Array(bytes[1...pciLen])
+            }
+        }
+        return bytes
+    }
+
+    /// Retourne la taille de charge utile (en octets) d'un PID SAE J1979 Mode 01/02 connu, ou `nil` si inconnu.
+    private static func obd2Mode02PIDDataLength(pid: UInt8) -> Int? {
+        switch pid {
+        case 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0x0F,
+             0x11, 0x12, 0x13, 0x1C, 0x1D, 0x1E, 0x2C, 0x2D, 0x2E, 0x2F, 0x30,
+             0x33, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x51, 0x52,
+             0x5A, 0x5B, 0x5C:
+            return 1
+        case 0x02, 0x03, 0x0C, 0x10, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A,
+             0x1B, 0x1F, 0x21, 0x22, 0x23, 0x31, 0x32, 0x3C, 0x3D, 0x3E, 0x3F,
+             0x42, 0x43, 0x44, 0x4D, 0x4E, 0x53, 0x54, 0x59, 0x5D, 0x5E:
+            return 2
+        case 0x00, 0x01, 0x20, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B,
+             0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x40, 0x41:
+            return 4
+        default:
+            return nil
         }
     }
 }

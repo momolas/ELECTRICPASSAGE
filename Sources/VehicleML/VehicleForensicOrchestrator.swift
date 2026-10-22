@@ -45,7 +45,7 @@ public struct VehicleForensicDossier: Sendable, Equatable, Codable {
         )
     }
 
-    /// Vérifie que l'empreinte d'intégrité `evidenceDigestHex` correspond exactement aux preuves du dossier.
+    /// Vérifie que l'empreinte d'intégrité `evidenceDigestHex` correspond exactement à l'intégralité des preuves du dossier.
     public func verifyIntegrity() -> Bool {
         let expected = Self.computeDigestHex(
             ecuName: ecuName,
@@ -59,7 +59,18 @@ public struct VehicleForensicDossier: Sendable, Equatable, Codable {
         return expected == evidenceDigestHex
     }
 
-    /// Calcule une empreinte FNV-1a 64-bits déterministe sur la représentation canonique des preuves.
+    private struct CanonicalEvidenceEnvelope: Encodable {
+        let ecuName: String
+        let udsScanReport: UDSSecurityScanReport
+        let calibrationInfo: ECUCalibrationInfo?
+        let edrCrashSnapshot: EDRCrashSnapshot?
+        let canFingerprint: CANBusFingerprint?
+        let busAnomalyReport: BusAnomalyReport?
+        let riskReport: AutomotiveRiskReport
+    }
+
+    /// Calcule une empreinte FNV-1a 64-bits déterministe couvrant 100 % des champs du dossier
+    /// via sérialisation JSON canonique (`sortedKeys` + gestion sûre des flottants non-finis `NaN`/`Inf`).
     public static func computeDigestHex(
         ecuName: String,
         udsScanReport: UDSSecurityScanReport,
@@ -69,19 +80,34 @@ public struct VehicleForensicDossier: Sendable, Equatable, Codable {
         busAnomalyReport: BusAnomalyReport?,
         riskReport: AutomotiveRiskReport
     ) -> String {
-        var canonical = "ECU:\(ecuName)|"
-        canonical += "SESSIONS:" + udsScanReport.sessions.map { "\($0.sessionType):\($0.isSupported)" }.joined(separator: ",") + "|"
-        canonical += "SERVICES:" + udsScanReport.services.map { "\($0.serviceID):\($0.availability.rawValue)" }.joined(separator: ",") + "|"
-        canonical += "SEEDS:" + udsScanReport.seedAudits.map { "\($0.level):\($0.posture.rawValue)" }.joined(separator: ",") + "|"
-        canonical += "CAL:\(calibrationInfo?.primaryCalID ?? "NONE"):\(calibrationInfo?.primaryCVN ?? "NONE")|"
-        canonical += "EDR:\(edrCrashSnapshot?.triggerDTC ?? "NONE"):\(Int((edrCrashSnapshot?.totalDeltaVMagnitudeKmh ?? 0.0) * 100.0))|"
-        canonical += "C0F:\(canFingerprint?.mainID ?? 0):\(canFingerprint?.idStatistics.count ?? 0)|"
-        canonical += "IDS:\(busAnomalyReport?.status.rawValue ?? "NONE"):\(Int((busAnomalyReport?.anomalyScore ?? 0.0) * 1000.0))|"
-        canonical += "RISK:\(riskReport.securityLevel.rawValue):\(Int(riskReport.dreadScore * 100.0))"
+        let envelope = CanonicalEvidenceEnvelope(
+            ecuName: ecuName,
+            udsScanReport: udsScanReport,
+            calibrationInfo: calibrationInfo,
+            edrCrashSnapshot: edrCrashSnapshot,
+            canFingerprint: canFingerprint,
+            busAnomalyReport: busAnomalyReport,
+            riskReport: riskReport
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.nonConformingFloatEncodingStrategy = .convertToString(
+            positiveInfinity: "+INF",
+            negativeInfinity: "-INF",
+            nan: "NAN"
+        )
+
+        let bytes: [UInt8]
+        if let jsonData = try? encoder.encode(envelope) {
+            bytes = Array(jsonData)
+        } else {
+            bytes = Array(ecuName.utf8)
+        }
 
         var hash: UInt64 = 0xcbf29ce484222325
         let prime: UInt64 = 0x100000001b3
-        for byte in canonical.utf8 {
+        for byte in bytes {
             hash ^= UInt64(byte)
             hash = hash &* prime
         }
@@ -114,11 +140,14 @@ public actor VehicleForensicOrchestrator {
         let udsReport = try await udsScanner.runFullScan()
         try Task.checkCancellation()
 
-        // 2. Lecture multi-protocoles des identifiants de calibration (CalID, CVN, détection Stage1/Tuning)
-        let calibration = try? await CalibrationReader.read(interface: interface)
+        // 2. Lecture multi-protocoles des identifiants de calibration sans écraser la cible CAN active
+        let calibration = try? await CalibrationReader.read(
+            interface: interface,
+            overrideTargetToStandardOBD: false
+        )
         try Task.checkCancellation()
 
-        // 3. Extraction de l'instantané boîte noire EDR (UDS 0x19 04 + repli OBD-II Mode 0x02)
+        // 3. Extraction de l'instantané boîte noire EDR (UDS 0x19 04 + repli OBD-II Mode 0x02) sur la cible active
         let edrSnapshot = try? await EDRCrashDecoder.readCrashSnapshot(using: interface, timeout: timeout)
         try Task.checkCancellation()
 
@@ -126,10 +155,15 @@ public actor VehicleForensicOrchestrator {
         let canFingerprint: CANBusFingerprint?
         let anomalyReport: BusAnomalyReport?
         if !capturedCANFrames.isEmpty {
-            canFingerprint = CANBusFingerprinter.fingerprint(frames: capturedCANFrames)
-            let detector = CANIntrusionDetector(windowSize: max(20, capturedCANFrames.count))
+            let sortedFrames = capturedCANFrames
+                .filter { $0.timestampSeconds.isFinite && $0.timestampSeconds >= 0 }
+                .sorted { $0.timestampSeconds < $1.timestampSeconds }
+
+            canFingerprint = CANBusFingerprinter.fingerprint(frames: sortedFrames)
+            let detector = CANIntrusionDetector(windowSize: max(20, sortedFrames.count))
             var lastReport: BusAnomalyReport?
-            for frame in capturedCANFrames {
+            for frame in sortedFrames {
+                try Task.checkCancellation()
                 lastReport = await detector.ingest(frame: frame)
             }
             anomalyReport = lastReport

@@ -199,7 +199,7 @@ public enum CANBusFingerprinter {
         // Les signaux haute fréquence d'un même calculateur/bus apparaissent avec un nombre d'occurrences
         // quasi identique (tolérance ±1 trame liée aux bords de fenêtre de capture).
         let maxCount = stats.map(\.occurrenceCount).max() ?? 0
-        let thresholdCount = max(2, Int((Double(maxCount) * 0.85).rounded(.down)))
+        let thresholdCount = (maxCount <= 1) ? 1 : max(2, Int((Double(maxCount) * 0.85).rounded(.down)))
 
         let commonStats = stats.filter { $0.occurrenceCount >= thresholdCount }
         let commonIDs = commonStats.map(\.canID).sorted()
@@ -231,9 +231,11 @@ public enum CANBusFingerprinter {
     public static func similarity(between lhs: CANBusFingerprint, and rhs: CANBusFingerprint) -> Double {
         guard lhs.sampleCount > 0 && rhs.sampleCount > 0 else { return 0.0 }
 
-        // 1. Recouvrement de Jaccard sur les `commonIDs` (poids 55%)
-        let setA = Set(lhs.commonIDs)
-        let setB = Set(rhs.commonIDs)
+        // 1. Recouvrement de Jaccard sur les `commonIDs` (ou repli sur `idStatistics` si vides, poids 55%)
+        let idsA = lhs.commonIDs.isEmpty ? lhs.idStatistics.map(\.canID) : lhs.commonIDs
+        let idsB = rhs.commonIDs.isEmpty ? rhs.idStatistics.map(\.canID) : rhs.commonIDs
+        let setA = Set(idsA)
+        let setB = Set(idsB)
         let unionCount = setA.union(setB).count
         let jaccardCommon = unionCount > 0 ? Double(setA.intersection(setB).count) / Double(unionCount) : 0.0
 
@@ -255,6 +257,8 @@ public enum CANBusFingerprinter {
         if let dtA = lhs.mainIntervalSeconds, let dtB = rhs.mainIntervalSeconds, dtA > 0, dtB > 0 {
             let relError = abs(dtA - dtB) / max(dtA, dtB)
             intervalScore = max(0.0, 1.0 - min(1.0, relError * 5.0))
+        } else if lhs.mainIntervalSeconds == nil && rhs.mainIntervalSeconds == nil {
+            intervalScore = 1.0
         } else {
             intervalScore = 0.0
         }

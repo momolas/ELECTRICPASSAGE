@@ -32,7 +32,7 @@ public enum InferredSignalCategory: String, Sendable, CaseIterable, Identifiable
 }
 
 /// Résultat de classification sémantique
-public struct SemanticClassificationResult: Sendable, Equatable, Identifiable {
+public struct SemanticClassificationResult: Sendable, Equatable, Identifiable, Codable {
     public var id: String { sliceName }
     public let sliceName: String
     public let category: InferredSignalCategory

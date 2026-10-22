@@ -118,9 +118,19 @@ public actor UDSSecurityScanner {
         results.reserveCapacity(candidates.count)
 
         for sessionID in candidates {
-            try Task.checkCancellation()
+            if Task.isCancelled { break }
             let cmd = String(format: "10%02X", sessionID)
-            let raw = try await interface.sendDiagnosticRequest(cmd, timeout: timeout)
+            guard let raw = try? await interface.sendDiagnosticRequest(cmd, timeout: timeout) else {
+                results.append(
+                    UDSSessionProbeResult(
+                        sessionType: sessionID,
+                        sessionName: Self.sessionName(for: sessionID),
+                        isSupported: false,
+                        negativeResponseCode: nil
+                    )
+                )
+                continue
+            }
             let bytes = Self.extractPDUBytes(from: raw)
 
             let isSupported: Bool
@@ -149,9 +159,8 @@ public actor UDSSecurityScanner {
         }
 
         // Retour systématique en DefaultSession (0x10 01) en fin d'audit
-        if !Task.isCancelled {
-            _ = try? await interface.sendDiagnosticRequest("1001", timeout: timeout)
-        }
+        _ = try? await interface.sendDiagnosticRequest("1001", timeout: timeout)
+        try Task.checkCancellation()
 
         return results
     }
@@ -211,10 +220,12 @@ public actor UDSSecurityScanner {
         return results
     }
 
-    /// Audite la sécurité du service `SecurityAccess (0x27)` sur un niveau impair donné (ex: `0x01`, `0x03`)
+    /// Audite la sécurité du service `SecurityAccess (0x27)` sur un niveau impair donné (`0x01...0x7D`)
     /// sans envoyer de mauvaise clé afin de ne jamais incrémenter le compteur d'échecs de l'ECU.
     public func auditSecurityAccessSeed(level: UInt8 = 0x01, timeout: TimeInterval = 2.0) async throws -> UDSSecuritySeedAudit {
-        guard level >= 1 && level < 0xFF && (level % 2 == 1) else {
+        // Selon ISO 14229-1 Table 42, les sous-fonctions requestSeed valides sont impaires dans 0x01...0x7D
+        // (0x7F est réservé et >= 0x80 active suppressPosRspMsgIndicationBit).
+        guard level >= 0x01 && level <= 0x7D && (level % 2 == 1) else {
             return UDSSecuritySeedAudit(
                 level: level,
                 posture: .notSupported,
@@ -284,7 +295,10 @@ public actor UDSSecurityScanner {
         let entropy = Self.shannonEntropy(bytes: combined)
 
         let posture: UDSSecuritySeedAudit.SeedPosture
-        if let s2 = seed2, s2 == seed1 {
+        if let s2 = seed2 {
+            posture = (s2 == seed1) ? .staticSeedVulnerability : .dynamicSeedNominal
+        } else if seed1.count >= 2 && Set(seed1).count <= 1 {
+            // Si la 2e requête a été rejetée mais que la 1re graine répète un octet unique (entropie 0, ex: 0xAAAA)
             posture = .staticSeedVulnerability
         } else {
             posture = .dynamicSeedNominal
@@ -328,8 +342,14 @@ public actor UDSSecurityScanner {
     internal static func extractPDUBytes(from raw: String) -> [UInt8] {
         let stripped = HexParsing.stripISOTPFraming(raw)
         var bytes = HexParsing.bytes(stripped) ?? []
-        if bytes.count >= 2 && bytes[0] <= 0x07 && Int(bytes[0]) == bytes.count - 1 {
-            bytes.removeFirst()
+        if bytes.count >= 2 && bytes[0] >= 0x01 && bytes[0] <= 0x07 {
+            let pciLen = Int(bytes[0])
+            let nextByte = bytes[1]
+            if pciLen == bytes.count - 1 {
+                bytes.removeFirst()
+            } else if bytes.count == 8 && pciLen < 7 && ((nextByte >= 0x50 && nextByte <= 0x7F) || nextByte == 0xC5) {
+                bytes = Array(bytes[1...pciLen])
+            }
         }
         return bytes
     }

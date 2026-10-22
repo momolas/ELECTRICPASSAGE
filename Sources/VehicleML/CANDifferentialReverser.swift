@@ -132,22 +132,26 @@ public enum CANDifferentialReverser: Sendable {
         var baseByID: [UInt32: [CANSampleFrame]] = [:]
         var stimByID: [UInt32: [CANSampleFrame]] = [:]
 
-        for frame in baselineFrames where !frame.payload.isEmpty {
+        for frame in baselineFrames where !frame.payload.isEmpty && frame.timestampSeconds.isFinite {
             baseByID[frame.canID, default: []].append(frame)
         }
-        for frame in stimulusFrames where !frame.payload.isEmpty {
+        for frame in stimulusFrames where !frame.payload.isEmpty && frame.timestampSeconds.isFinite {
             stimByID[frame.canID, default: []].append(frame)
         }
 
         var candidates: [CANDifferentialBitCandidate] = []
 
         for canID in baseByID.keys.sorted() {
-            guard let baseList = baseByID[canID],
-                  let stimList = stimByID[canID],
-                  baseList.count >= minCount,
-                  stimList.count >= minCount else {
+            guard let rawBase = baseByID[canID],
+                  let rawStim = stimByID[canID],
+                  rawBase.count >= minCount,
+                  rawStim.count >= minCount else {
                 continue
             }
+
+            // Tri chronologique strict pour garantir la détection des compteurs cycliques (+1 step)
+            let baseList = rawBase.sorted { $0.timestampSeconds < $1.timestampSeconds }
+            let stimList = rawStim.sorted { $0.timestampSeconds < $1.timestampSeconds }
 
             let minBaseDLC = baseList.map(\.payload.count).min() ?? 0
             let minStimDLC = stimList.map(\.payload.count).min() ?? 0
@@ -266,9 +270,9 @@ public enum CANDifferentialReverser: Sendable {
         var rawCandidates: [DiscoveredCANSignal] = []
 
         for canID in framesByID.keys.sorted() {
-            guard let idFrames = framesByID[canID], idFrames.count >= 6 else { continue }
-            let dlc = idFrames.map(\.payload.count).min() ?? 0
-            guard dlc >= 1 else { continue }
+            guard let rawIDFrames = framesByID[canID], rawIDFrames.count >= 6 else { continue }
+            // Tri chronologique strict avant alignement et classification de compteurs cycliques
+            let idFrames = rawIDFrames.sorted { $0.timestampSeconds < $1.timestampSeconds }
 
             // Alignement temporel de chaque trame avec l'échantillon de référence le plus proche
             var alignedFrames: [CANSampleFrame] = []
@@ -284,6 +288,8 @@ public enum CANDifferentialReverser: Sendable {
             }
 
             guard alignedFrames.count >= 6 else { continue }
+            let dlc = alignedFrames.map(\.payload.count).min() ?? 0
+            guard dlc >= 1 else { continue }
 
             // 1. Test des tranches 16-bits (Motorola Big-Endian & Intel Little-Endian)
             var coveredBytesByHighPrecision16Bit: Set<Int> = []
@@ -371,11 +377,18 @@ public enum CANDifferentialReverser: Sendable {
             if abs($0.rSquared - $1.rSquared) > 1e-6 {
                 return $0.rSquared > $1.rSquared
             }
-            return $0.canID < $1.canID
+            if $0.canID != $1.canID {
+                return $0.canID < $1.canID
+            }
+            if $0.startByte != $1.startByte {
+                return $0.startByte < $1.startByte
+            }
+            return $0.bitLength > $1.bitLength
         }
     }
 
     /// Synthétise un fichier standard Vector `.dbc` à partir des signaux analogiques et des bits d'état découverts.
+    /// Pour les identifiants CAN étendus 29-bits (`canID > 0x7FF`, ex: SAE J1939), active le bit 31 (`0x80000000`) conformément à la norme Vector DBC.
     public static func synthesizeDBC(
         analogSignals: [DiscoveredCANSignal],
         bitCandidates: [CANDifferentialBitCandidate] = [],
@@ -411,27 +424,60 @@ public enum CANDifferentialReverser: Sendable {
 
         for canID in allCANIDs.sorted() {
             let dlc = dlcByID[canID] ?? 8
-            let hexID = String(format: "%03X", canID)
-            lines.append("BO_ \(canID) MSG_\(hexID): \(dlc) Vector__XXX")
+            let isExtended29Bit = canID > 0x7FF
+            let dbcMessageID: UInt32 = isExtended29Bit
+                ? ((canID & 0x1FFFFFFF) | 0x80000000)
+                : canID
+            let hexID = isExtended29Bit
+                ? String(format: "%08X", canID & 0x1FFFFFFF)
+                : String(format: "%03X", canID)
+            lines.append("BO_ \(dbcMessageID) MSG_\(hexID): \(dlc) Vector__XXX")
 
-            let analogs = analogSignals.filter { $0.canID == canID }
+            var usedNames = Set<String>()
+
+            let analogs = analogSignals
+                .filter { $0.canID == canID }
+                .sorted { ($0.startByte, $0.dbcStartBit) < ($1.startByte, $1.dbcStartBit) }
+
             for sig in analogs {
-                let sanitizedName = sanitizeIdentifier(sig.name)
+                var baseName = sanitizeIdentifier(sig.name)
+                if usedNames.contains(baseName) {
+                    baseName = "\(baseName)_B\(sig.startByte)"
+                }
+                var uniqueName = baseName
+                var suffix = 2
+                while usedNames.contains(uniqueName) {
+                    uniqueName = "\(baseName)_\(suffix)"
+                    suffix += 1
+                }
+                usedNames.insert(uniqueName)
+
                 let scaleStr = formatDecimal(sig.scale)
                 let offsetStr = formatDecimal(sig.offset)
                 let minStr = formatDecimal(sig.minValue)
                 let maxStr = formatDecimal(sig.maxValue)
                 lines.append(
-                    " SG_ \(sanitizedName) : \(sig.dbcStartBit)|\(sig.bitLength)@\(sig.byteOrder.dbcIndicator)+ (\(scaleStr),\(offsetStr)) [\(minStr)|\(maxStr)] \"\(sig.unit)\" Vector__XXX"
+                    " SG_ \(uniqueName) : \(sig.dbcStartBit)|\(sig.bitLength)@\(sig.byteOrder.dbcIndicator)+ (\(scaleStr),\(offsetStr)) [\(minStr)|\(maxStr)] \"\(sig.unit)\" Vector__XXX"
                 )
             }
 
-            let bits = bitCandidates.filter { $0.canID == canID }
+            let bits = bitCandidates
+                .filter { $0.canID == canID }
+                .sorted { ($0.byteIndex, $0.bitIndex) < ($1.byteIndex, $1.bitIndex) }
+
             for bit in bits {
                 let absBit = bit.byteIndex * 8 + bit.bitIndex
-                let sigName = String(format: "STATE_%03X_B%d_BIT%d", canID, bit.byteIndex, bit.bitIndex)
+                let baseBitName = String(format: "STATE_%@_B%d_BIT%d", hexID, bit.byteIndex, bit.bitIndex)
+                var uniqueBitName = baseBitName
+                var suffix = 2
+                while usedNames.contains(uniqueBitName) {
+                    uniqueBitName = "\(baseBitName)_\(suffix)"
+                    suffix += 1
+                }
+                usedNames.insert(uniqueBitName)
+
                 lines.append(
-                    " SG_ \(sigName) : \(absBit)|1@1+ (1,0) [0|1] \"flag\" Vector__XXX"
+                    " SG_ \(uniqueBitName) : \(absBit)|1@1+ (1,0) [0|1] \"flag\" Vector__XXX"
                 )
             }
 
@@ -518,9 +564,15 @@ public enum CANDifferentialReverser: Sendable {
         let rawOffset = meanY - rawScale * meanX
         guard rawScale.isFinite && rawOffset.isFinite && abs(rawScale) > 1e-9 else { return nil }
 
-        // Arrondi propre à 6 décimales pour éviter le bruit IEEE-754 dans les fichiers .dbc
-        let cleanScale = (rawScale * 1_000_000.0).rounded() / 1_000_000.0
-        let cleanOffset = (rawOffset * 10_000.0).rounded() / 10_000.0
+        // Arrondi propre sans écraser les petites pentes (< 1e-4) à zéro
+        let cleanScale: Double
+        if abs(rawScale) >= 1e-4 {
+            cleanScale = (rawScale * 1_000_000.0).rounded() / 1_000_000.0
+        } else {
+            cleanScale = rawScale
+        }
+        guard cleanScale != 0.0 else { return nil }
+        let cleanOffset = (rawOffset * 10_000.0).rounded() / 10_000.0 + 0.0
 
         let minRaw = rawValues.min() ?? 0.0
         let maxRaw = rawValues.max() ?? 0.0
@@ -546,20 +598,32 @@ public enum CANDifferentialReverser: Sendable {
     private static func sanitizeIdentifier(_ text: String) -> String {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_"))
         let cleaned = text.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
-        let result = String(cleaned)
-        return result.isEmpty ? "SIGNAL" : result
+        var result = String(cleaned)
+        if result.isEmpty {
+            return "SIGNAL"
+        }
+        if let first = result.first, first.isNumber {
+            result = "SIG_" + result
+        }
+        return result
     }
 
     private static func formatDecimal(_ value: Double) -> String {
-        if abs(value.rounded() - value) < 1e-6 {
-            return String(format: "%.0f", value.rounded())
+        guard value.isFinite else { return "0" }
+        let normalized = value + 0.0
+        if abs(normalized.rounded() - normalized) < 1e-6 && abs(normalized) >= 1.0 || normalized == 0.0 {
+            let r = normalized.rounded() + 0.0
+            return String(format: "%.0f", r)
         }
-        var s = String(format: "%.6f", value)
+        var s = String(format: "%.6f", normalized)
         while s.hasSuffix("0") {
             s.removeLast()
         }
         if s.hasSuffix(".") {
             s.removeLast()
+        }
+        if s == "-0" || s == "0" {
+            return String(format: "%.6e", normalized)
         }
         return s
     }
