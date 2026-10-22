@@ -84,6 +84,11 @@ public actor UDSClient {
         let hexCmd = String(format: "10%02X", sessionType)
         let response = try await sendRaw(hexCmd)
         try validatePositiveResponse(response, expectedSID: 0x10)
+        VehicleLogger.shared.info(
+            .diagnostic,
+            "UDS DiagnosticSessionControl (0x10) active: session 0x\(String(format: "%02X", sessionType))",
+            metadata: ["session": String(format: "%02X", sessionType)]
+        )
 
         if keepAlive && sessionType != 0x01 && !Task.isCancelled {
             startTesterPresentLoop()
@@ -99,6 +104,7 @@ public actor UDSClient {
         let hexCmd = String(format: "11%02X", type.rawValue)
         let response = try await sendRaw(hexCmd)
         try validatePositiveResponse(response, expectedSID: 0x11)
+        VehicleLogger.shared.info(.diagnostic, "UDS ECUReset (0x11) executed: type 0x\(String(format: "%02X", type.rawValue))")
     }
 
     // MARK: - ClearDiagnosticInformation (0x14)
@@ -107,6 +113,7 @@ public actor UDSClient {
         let hexCmd = String(format: "14%06X", groupOfDTC & 0xFFFFFF)
         let response = try await sendRaw(hexCmd)
         try validatePositiveResponse(response, expectedSID: 0x14)
+        VehicleLogger.shared.info(.diagnostic, "UDS ClearDiagnosticInformation (0x14) executed")
     }
 
     // MARK: - ReadDTCInformation (0x19)
@@ -180,6 +187,7 @@ public actor UDSClient {
 
         // Si la graine est déjà zéro, l'accès est déjà déverrouillé
         if seed.allSatisfy({ $0 == "0" }) {
+            VehicleLogger.shared.info(.security, "UDS SecurityAccess level 0x\(String(format: "%02X", requestLevel)) already unlocked (zero seed)")
             return
         }
 
@@ -190,6 +198,7 @@ public actor UDSClient {
         let keyCmd = String(format: "27%02X%@", sendKeyLevel, key)
         let keyResponse = try await sendRaw(keyCmd)
         try validatePositiveResponse(keyResponse, expectedSID: 0x27)
+        VehicleLogger.shared.info(.security, "UDS SecurityAccess level 0x\(String(format: "%02X", requestLevel)) unlocked")
     }
 
     // MARK: - CommunicationControl (0x28)
@@ -451,6 +460,7 @@ public actor UDSClient {
 
         let pendingPrefix = String(format: "7F%02X78", expectedSID)
         while clean.hasPrefix(pendingPrefix) && clean.count > 6 {
+            VehicleLogger.shared.notice(.diagnostic, "UDS NRC 0x78 (ResponsePending) stripped for SID 0x\(String(format: "%02X", expectedSID))")
             clean = String(clean.dropFirst(6))
         }
 
@@ -461,6 +471,11 @@ public actor UDSClient {
             let service = UInt8(clean.dropFirst(2).prefix(2), radix: 16) ?? 0
             let nrc = UInt8(clean.dropFirst(4).prefix(2), radix: 16) ?? 0
             let msg = UDSNRC(rawValue: nrc)?.title ?? UDSNRC.description(for: nrc)
+            VehicleLogger.shared.warning(
+                .diagnostic,
+                "UDS Negative Response [SID 0x\(String(format: "%02X", service)), NRC 0x\(String(format: "%02X", nrc))]: \(msg)",
+                metadata: ["sid": String(format: "%02X", service), "nrc": String(format: "%02X", nrc)]
+            )
             throw UDSError.negativeResponse(service: service, nrc: nrc, message: msg)
         }
 

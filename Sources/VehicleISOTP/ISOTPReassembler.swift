@@ -119,19 +119,31 @@ public actor ISOTPReassembler {
                 buffer: initialBuffer,
                 nextSequence: 1
             )
+            let addrHex = String(format: "%X", address)
+            VehicleLogger.shared.debug(
+                .isotp,
+                "ISO-TP FirstFrame on 0x\(addrHex): totalLength=\(length) bytes",
+                metadata: ["address": addrHex, "totalLength": "\(length)"]
+            )
             return .needsFlowControl
 
         case 2: // Consecutive Frame (CF)
             guard frame.count >= 2 else {
                 return .error("Trame Consecutive Frame vide")
             }
+            let addrHex = String(format: "%X", address)
             guard var state = states[address] else {
-                return .error("Trame Consecutive Frame orpheline sur 0x\(String(format: "%X", address))")
+                VehicleLogger.shared.warning(.isotp, "Orphan ISO-TP ConsecutiveFrame on 0x\(addrHex)")
+                return .error("Trame Consecutive Frame orpheline sur 0x\(addrHex)")
             }
 
             let sequence = frame[0] & 0x0F
             guard sequence == state.nextSequence else {
                 states.removeValue(forKey: address)
+                VehicleLogger.shared.warning(
+                    .isotp,
+                    "ISO-TP sequence mismatch on 0x\(addrHex): got \(sequence), expected \(state.nextSequence)"
+                )
                 return .error("Erreur séquence ISO-TP : reçu \(sequence), attendu \(state.nextSequence)")
             }
 
@@ -142,8 +154,13 @@ public actor ISOTPReassembler {
 
             if state.buffer.count >= state.totalLength {
                 states.removeValue(forKey: address)
-                let completedData = state.buffer.prefix(state.totalLength)
-                return .completed(Data(completedData))
+                let completedData = Data(state.buffer.prefix(state.totalLength))
+                VehicleLogger.shared.debug(
+                    .isotp,
+                    "ISO-TP reassembly completed on 0x\(addrHex) (\(completedData.count) bytes)",
+                    metadata: ["address": addrHex, "bytes": "\(completedData.count)"]
+                )
+                return .completed(completedData)
             } else {
                 states[address] = state
                 return .pending

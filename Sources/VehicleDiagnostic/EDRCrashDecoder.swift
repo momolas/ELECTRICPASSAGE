@@ -221,12 +221,23 @@ public enum EDRCrashDecoder {
         let udsCmd = String(format: "1904%@%02X", dtcMaskHex, recordNumber)
         let udsResp = try await interface.sendDiagnosticRequest(udsCmd, timeout: timeout)
         if let snapshot = decodeUDSSnapshot(from: udsResp) {
+            VehicleLogger.shared.info(
+                .forensic,
+                "EDR UDS 0x19 04 crash snapshot decoded: DTC=\(snapshot.triggerDTC), speed=\(Int(snapshot.vehicleSpeedKmh)) km/h, dV=\(String(format: "%.1f", snapshot.totalDeltaVMagnitudeKmh)) km/h"
+            )
             return snapshot
         }
 
         try Task.checkCancellation()
         let obdResp = try await interface.sendDiagnosticRequest("020200", timeout: timeout)
-        return decodeOBD2FreezeFrame(from: obdResp)
+        let obdSnapshot = decodeOBD2FreezeFrame(from: obdResp)
+        if let snap = obdSnapshot {
+            VehicleLogger.shared.info(
+                .forensic,
+                "EDR OBD-II Mode 02 freeze frame decoded: DTC=\(snap.triggerDTC), speed=\(Int(snap.vehicleSpeedKmh)) km/h"
+            )
+        }
+        return obdSnapshot
     }
 
     /// Classifie la sévérité d'impact selon les seuils cinématiques SAE J1698 / NHTSA EDR

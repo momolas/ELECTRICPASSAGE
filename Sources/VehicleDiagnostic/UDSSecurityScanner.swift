@@ -98,6 +98,18 @@ public struct UDSSecurityScanReport: Sendable, Equatable, Codable {
         self.services = services
         self.seedAudits = seedAudits
     }
+
+    public var supportedSessionCount: Int {
+        sessions.filter(\.isSupported).count
+    }
+
+    public var exposedServicesCount: Int {
+        services.filter { $0.availability != .unsupported }.count
+    }
+
+    public var hasSeedVulnerability: Bool {
+        seedAudits.contains { $0.posture == .staticSeedVulnerability || $0.posture == .unlockedByDefault }
+    }
 }
 
 /// Scanner défensif et non destructif de surface d'attaque UDS (ISO 14229)
@@ -304,6 +316,19 @@ public actor UDSSecurityScanner {
             posture = .dynamicSeedNominal
         }
 
+        if posture == .staticSeedVulnerability || posture == .unlockedByDefault {
+            VehicleLogger.shared.warning(
+                .security,
+                "UDS SecurityAccess 0x27 level 0x\(String(format: "%02X", level)) vulnerability: \(posture.rawValue) (H=\(String(format: "%.2f", entropy)) bits/byte)",
+                metadata: ["level": String(format: "%02X", level), "posture": posture.rawValue]
+            )
+        } else {
+            VehicleLogger.shared.info(
+                .security,
+                "UDS SecurityAccess 0x27 level 0x\(String(format: "%02X", level)) posture: \(posture.rawValue) (H=\(String(format: "%.2f", entropy)) bits/byte)"
+            )
+        }
+
         return UDSSecuritySeedAudit(
             level: level,
             posture: posture,
@@ -319,6 +344,7 @@ public actor UDSSecurityScanner {
         sessionCandidates: [UInt8] = [0x01, 0x02, 0x03],
         securityLevels: [UInt8] = [0x01, 0x03]
     ) async throws -> UDSSecurityScanReport {
+        VehicleLogger.shared.info(.security, "Starting UDS non-destructive security surface scan")
         let sessions = try await probeSessions(candidates: sessionCandidates)
         let services = try await probeServices()
 
@@ -330,11 +356,16 @@ public actor UDSSecurityScanner {
             audits.append(audit)
         }
 
-        return UDSSecurityScanReport(
+        let report = UDSSecurityScanReport(
             sessions: sessions,
             services: services,
             seedAudits: audits
         )
+        VehicleLogger.shared.info(
+            .security,
+            "UDS security scan completed: \(report.supportedSessionCount) sessions, \(report.exposedServicesCount) exposed services, vulnerableSeed=\(report.hasSeedVulnerability)"
+        )
+        return report
     }
 
     // MARK: - Helpers

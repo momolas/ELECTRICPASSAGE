@@ -52,9 +52,11 @@ public final class BusCoordinator: Sendable {
             // Réentrance autorisée UNIQUEMENT si le même token de session dynamique est présent
             if let activeToken = activeSessionToken, activeToken == token {
                 activeDepth += 1
+                VehicleLogger.shared.trace(.bus, "Reentrant bus lock acquired for '\(name)' (depth: \(activeDepth))")
                 return true
             }
 
+            VehicleLogger.shared.debug(.bus, "Bus busy (\(activeSessionName ?? "unknown")), queuing waiter '\(name)' (priority: \(priority.rawValue))")
             let waiterId = UUID()
             return await withTaskCancellationHandler {
                 await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
@@ -90,6 +92,7 @@ public final class BusCoordinator: Sendable {
             activeSessionName = name
             activeSessionToken = token
             activeDepth = 0
+            VehicleLogger.shared.debug(.bus, "Bus lock acquired by '\(name)' (priority: \(priority.rawValue))")
             return true
         }
     }
@@ -97,6 +100,7 @@ public final class BusCoordinator: Sendable {
     private func removeWaiter(id: UUID) {
         if let index = waiters.firstIndex(where: { $0.id == id }) {
             let removed = waiters.remove(at: index)
+            VehicleLogger.shared.notice(.bus, "Cancelled queued bus waiter '\(removed.name)'")
             removed.continuation.resume(returning: false)
         }
     }
@@ -118,13 +122,16 @@ public final class BusCoordinator: Sendable {
             activeSessionName = next.name
             activeSessionToken = next.token
             activeDepth = 0
+            VehicleLogger.shared.debug(.bus, "Direct bus lock handoff to '\(next.name)' (priority: \(next.priority.rawValue))")
             next.continuation.resume(returning: true)
         } else {
+            let releasedName = activeSessionName ?? "unknown"
             isBusy = false
             activeSessionName = nil
             activeSessionToken = nil
             activePriority = .background
             activeDepth = 0
+            VehicleLogger.shared.debug(.bus, "Bus lock released by '\(releasedName)'")
         }
     }
 

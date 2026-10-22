@@ -134,6 +134,10 @@ public actor VehicleForensicOrchestrator {
         timeout: TimeInterval = 2.0
     ) async throws -> VehicleForensicDossier {
         try Task.checkCancellation()
+        VehicleLogger.shared.info(
+            .forensic,
+            "Starting forensic dossier collection for ECU '\(ecuName)' (capturedCANFrames=\(capturedCANFrames.count))"
+        )
 
         // 1. Scan non-destructif de surface UDS (Sessions, Services, Graines SecurityAccess 0x27)
         let udsScanner = UDSSecurityScanner(interface: interface)
@@ -195,7 +199,7 @@ public actor VehicleForensicOrchestrator {
 
         let riskReport = AutomotiveRiskAssessor.evaluateECUPosture(observations)
 
-        return VehicleForensicDossier(
+        let dossier = VehicleForensicDossier(
             ecuName: ecuName,
             udsScanReport: udsReport,
             calibrationInfo: calibration,
@@ -204,5 +208,11 @@ public actor VehicleForensicOrchestrator {
             busAnomalyReport: anomalyReport,
             riskReport: riskReport
         )
+        VehicleLogger.shared.info(
+            .forensic,
+            "Forensic dossier sealed for '\(ecuName)': risk=\(riskReport.securityLevel.rawValue), digest=\(dossier.evidenceDigestHex)",
+            metadata: ["ecu": ecuName, "digest": dossier.evidenceDigestHex, "risk": riskReport.securityLevel.rawValue]
+        )
+        return dossier
     }
 }

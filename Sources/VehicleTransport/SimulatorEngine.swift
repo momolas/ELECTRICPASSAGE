@@ -111,17 +111,57 @@ public actor SimulatorEngine: VehicleInterface {
                 self.currentRx = String(format: "%X", txVal + 8)
             }
         }
+        VehicleLogger.shared.debug(
+            .transport,
+            "Simulator target set to TX=\(self.currentTx) RX=\(self.currentRx)",
+            metadata: ["txID": self.currentTx, "rxID": self.currentRx]
+        )
     }
 
     public func sendRawCAN(id: UInt32, data: Data, bus: UInt8) async throws {
-        // Enregistrement de trame brute virtuelle
+        let hexID = String(format: "%X", id)
+        let hexPayload = HexParsing.hex(Array(data))
+        VehicleLogger.shared.logFrame(
+            direction: .tx,
+            level: .trace,
+            category: .transport,
+            canID: hexID,
+            payloadHex: hexPayload,
+            bus: bus
+        )
     }
 
     public func sendDiagnosticRequest(_ requestHex: String, timeout: TimeInterval = 2.0) async throws -> String {
+        let startTime = Date().timeIntervalSince1970
         let clean = requestHex.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: " ", with: "")
             .uppercased()
 
+        let txAddr = self.currentTx
+        let rxAddr = self.currentRx
+        VehicleLogger.shared.logFrame(
+            direction: .tx,
+            level: .debug,
+            category: .transport,
+            canID: txAddr,
+            payloadHex: clean,
+            timestamp: startTime
+        )
+
+        let response = processDiagnosticRequest(clean)
+        let latencyMs = max(0.0, (Date().timeIntervalSince1970 - startTime) * 1000.0)
+        VehicleLogger.shared.logFrame(
+            direction: .rx,
+            level: .debug,
+            category: .transport,
+            canID: rxAddr,
+            payloadHex: response,
+            latencyMs: latencyMs
+        )
+        return response
+    }
+
+    private func processDiagnosticRequest(_ clean: String) -> String {
         // 1. Session request (10)
         if clean.hasPrefix("10") {
             guard clean.count >= 4 else { return "7F1013" }

@@ -202,6 +202,14 @@ public actor CANIntrusionDetector {
             rationale = "Entropie de charge utile anormalement élevée (\(roundedEntropy) bits/octet), possible flux aléatoire ou payload inconnu."
         }
 
+        if status != .nominal {
+            VehicleLogger.shared.warning(
+                .security,
+                "CAN IDS Alert [\(status.rawValue)] score=\(String(format: "%.2f", score)): \(rationale)",
+                metadata: ["status": status.rawValue, "score": String(format: "%.2f", score)]
+            )
+        }
+
         return BusAnomalyReport(
             status: status,
             anomalyScore: score,

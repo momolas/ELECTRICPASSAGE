@@ -206,14 +206,17 @@ public actor PandaDriver: VehicleInterface {
     public func connect() async throws {
         // Real or simulated connection
         self.isConnected = true
+        VehicleLogger.shared.info(.transport, "PandaDriver connected")
     }
 
     public func disconnect() async {
         self.isConnected = false
+        VehicleLogger.shared.info(.transport, "PandaDriver disconnected")
     }
 
     public func setSafetyModel(_ model: PandaSafetyModel) async throws {
         self.currentSafetyModel = model
+        VehicleLogger.shared.info(.transport, "Panda safety model set to 0x\(String(format: "%02X", model.rawValue))")
     }
 
     public func setTarget(txID: String, rxID: String?) async throws {
@@ -232,26 +235,56 @@ public actor PandaDriver: VehicleInterface {
                 self.currentRx = String(format: "%X", txVal + 8)
             }
         }
+        VehicleLogger.shared.debug(.transport, "PandaDriver target set to TX=\(self.currentTx) RX=\(self.currentRx)")
     }
 
     public func sendRawCAN(id: UInt32, data: Data, bus: UInt8) async throws {
         guard isConnected else {
             throw NSError(domain: "PandaDriver", code: -1, userInfo: [NSLocalizedDescriptionKey: "Panda non connecté"])
         }
+        VehicleLogger.shared.logFrame(
+            direction: .tx,
+            level: .trace,
+            category: .transport,
+            canID: String(format: "%X", id),
+            payloadHex: HexParsing.hex(Array(data)),
+            bus: bus
+        )
     }
 
     public func sendDiagnosticRequest(_ requestHex: String, timeout: TimeInterval = 2.0) async throws -> String {
         guard isConnected else {
             throw NSError(domain: "PandaDriver", code: -1, userInfo: [NSLocalizedDescriptionKey: "Panda non connecté"])
         }
+        let startTime = Date().timeIntervalSince1970
         let clean = requestHex
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .uppercased()
             .replacing(" ", with: "")
-        guard clean.count >= 2, let reqSID = UInt8(clean.prefix(2), radix: 16) else {
-            return "60" + clean
+        VehicleLogger.shared.logFrame(
+            direction: .tx,
+            level: .debug,
+            category: .transport,
+            canID: currentTx,
+            payloadHex: clean,
+            timestamp: startTime
+        )
+        let response: String
+        if clean.count >= 2, let reqSID = UInt8(clean.prefix(2), radix: 16) {
+            let respSID = String(format: "%02X", reqSID &+ 0x40)
+            response = respSID + clean.dropFirst(2)
+        } else {
+            response = "60" + clean
         }
-        let respSID = String(format: "%02X", reqSID &+ 0x40)
-        return respSID + clean.dropFirst(2)
+        let latencyMs = max(0.0, (Date().timeIntervalSince1970 - startTime) * 1000.0)
+        VehicleLogger.shared.logFrame(
+            direction: .rx,
+            level: .debug,
+            category: .transport,
+            canID: currentRx,
+            payloadHex: response,
+            latencyMs: latencyMs
+        )
+        return response
     }
 }

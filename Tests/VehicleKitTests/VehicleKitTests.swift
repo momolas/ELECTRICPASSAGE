@@ -2449,7 +2449,86 @@ struct VehicleKitTests {
         #expect(dossier.edrCrashSnapshot?.triggerDTC == "B0001")
         #expect(dossier.calibrationInfo?.primaryCalID == "SRS_CAL_01")
     }
+
+    // MARK: - VehicleLogger & Flight Recorder (v2.7.0)
+
+    @Test("VehicleLogger: O(1) circular ring buffer rotation, level/category filtering, and concurrency safety")
+    func testVehicleLoggerRingBufferAndFiltering() async {
+        let logger = VehicleLogger(capacity: 16, minimumLevel: .debug, osLogEnabled: false)
+
+        // Un événement .trace doit être filtré lorsque minimumLevel == .debug
+        logger.trace(.bus, "Ignored trace event")
+        #expect(logger.recentEntries().isEmpty)
+
+        // Insertion de 25 entrées dans un tampon circulaire de capacité 16
+        for i in 1...25 {
+            let category: VehicleLogCategory = (i % 2 == 0) ? .security : .diagnostic
+            let level: VehicleLogLevel = (i >= 20) ? .warning : .info
+            logger.log(level, category: category, "Event #\(i)", metadata: ["index": "\(i)"])
+        }
+
+        let all = logger.recentEntries()
+        #expect(all.count == 16)
+        #expect(all.first?.id == 10)
+        #expect(all.last?.id == 25)
+        #expect(all.first?.message == "Event #10")
+        #expect(all.last?.message == "Event #25")
+
+        let warningsOnly = logger.recentEntries(minLevel: .warning)
+        #expect(warningsOnly.count == 6) // Events 20..25
+
+        let securityWarnings = logger.recentEntries(minLevel: .warning, category: .security)
+        #expect(securityWarnings.count == 3) // Events 20, 22, 24
+
+        // Reconfiguration dynamique de capacité à la baisse (garde les 16 dernières si cap=16)
+        logger.clear()
+        #expect(logger.recentEntries().isEmpty)
+    }
+
+    @Test("VehicleLogger: candump (.log) and JSONL forensic exporters + SimulatorEngine instrumentation")
+    func testVehicleLoggerCANDumpAndJSONLExport() async throws {
+        let customLogger = VehicleLogger(capacity: 64, minimumLevel: .trace, osLogEnabled: false)
+        customLogger.logFrame(
+            direction: .tx,
+            level: .debug,
+            category: .transport,
+            canID: "0x7E0",
+            payloadHex: "02 10 03",
+            bus: 0,
+            timestamp: 1729624200.125
+        )
+        customLogger.logFrame(
+            direction: .rx,
+            level: .debug,
+            category: .transport,
+            canID: "7E8",
+            payloadHex: "06 50 03 00 32 01 F4",
+            bus: 0,
+            latencyMs: 3.4,
+            timestamp: 1729624200.1284
+        )
+        customLogger.info(.forensic, "Dossier sealed", metadata: ["ecu": "EMS_7E0"])
+
+        let candump = customLogger.exportCANDumpLog()
+        let candumpLines = candump.split(separator: "\n").map(String.init)
+        #expect(candumpLines.count == 2)
+        #expect(candumpLines[0] == "(1729624200.125000) can0 7E0#021003")
+        #expect(candumpLines[1] == "(1729624200.128400) can0 7E8#065003003201F4")
+
+        let jsonl = customLogger.exportJSONLines()
+        let jsonLines = jsonl.split(separator: "\n").map(String.init)
+        #expect(jsonLines.count == 3)
+        #expect(jsonLines[0].contains("\"canID\":\"0x7E0\""))
+        #expect(jsonLines[2].contains("\"category\":\"forensic\""))
+
+        // Vérifie que SimulatorEngine et UDSClient alimentent automatiquement VehicleLogger.shared
+        let sim = SimulatorEngine()
+        try await sim.setTarget(txID: "7E0", rxID: "7E8")
+        let resp = try await sim.sendDiagnosticRequest("1003", timeout: 1.0)
+        #expect(resp.hasPrefix("5003"))
+
+        let sharedFrames = VehicleLogger.shared.recentEntries(category: .transport)
+        #expect(sharedFrames.contains { $0.direction == .tx && $0.payloadHex == "1003" })
+        #expect(sharedFrames.contains { $0.direction == .rx && ($0.payloadHex?.hasPrefix("5003") == true) })
+    }
 }
-
-
-

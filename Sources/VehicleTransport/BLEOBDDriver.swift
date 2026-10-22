@@ -158,28 +158,51 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
         }
 
         // Mode simulateur / fallback autonome pour les requêtes OBD-II & UDS standards
+        let startTime = Date().timeIntervalSince1970
         let upper = cleanCmd.uppercased().replacing(" ", with: "")
+        if !upper.hasPrefix("AT") {
+            VehicleLogger.shared.logFrame(
+                direction: .tx,
+                level: .debug,
+                category: .transport,
+                canID: currentTx,
+                payloadHex: upper,
+                timestamp: startTime
+            )
+        }
+        let response: String
         if upper.hasPrefix("AT") {
             return "OK"
         } else if upper.hasPrefix("0100") {
-            return "41 00 BE 3E B8 11"
+            response = "41 00 BE 3E B8 11"
         } else if upper.hasPrefix("010C") {
-            return "41 0C 0B B8" // 750 RPM
+            response = "41 0C 0B B8" // 750 RPM
         } else if upper.hasPrefix("010D") {
-            return "41 0D 32" // 50 km/h
+            response = "41 0D 32" // 50 km/h
         } else if upper.hasPrefix("03") {
-            return "43 01 02 00 00 00 00" // P0102 conforme SAE J1979 sans octet de compte parasite
+            response = "43 01 02 00 00 00 00" // P0102 conforme SAE J1979 sans octet de compte parasite
         } else if upper.hasPrefix("07") {
-            return "47 01 02 00 00 00 00"
+            response = "47 01 02 00 00 00 00"
         } else if upper.hasPrefix("0A") {
-            return "4A 01 02 00 00 00 00"
+            response = "4A 01 02 00 00 00 00"
         } else if upper.hasPrefix("1902") {
-            return "59 02 FF 01 02 00 2F" // UDS DTC P0102 actif + confirmé
+            response = "59 02 FF 01 02 00 2F" // UDS DTC P0102 actif + confirmé
         } else if upper.hasPrefix("22F190") {
-            return "62 F1 90 56 46 31 4A 4D 30 47 30 44 31 32 33 34 35 36 37 38" // VIN
+            response = "62 F1 90 56 46 31 4A 4D 30 47 30 44 31 32 33 34 35 36 37 38" // VIN
+        } else {
+            response = "41" + upper.dropFirst(2) + "00"
         }
 
-        return "41" + upper.dropFirst(2) + "00"
+        let latencyMs = max(0.0, (Date().timeIntervalSince1970 - startTime) * 1000.0)
+        VehicleLogger.shared.logFrame(
+            direction: .rx,
+            level: .debug,
+            category: .transport,
+            canID: currentRx,
+            payloadHex: response,
+            latencyMs: latencyMs
+        )
+        return response
     }
 
     public func sendRawCAN(id: UInt32, data: Data, bus: UInt8) async throws {
@@ -197,6 +220,7 @@ public actor BLEOBDDriver: NSObject, VehicleInterface {
         self.responseContinuation = nil
         self.timeoutTask = nil
         self.responseBuffer = ""
+        VehicleLogger.shared.warning(.transport, "BLEOBDDriver timeout waiting for ELM/STN prompt '>' (requestId: \(requestId))")
         continuation.resume(throwing: NSError(domain: "BLEOBDDriver", code: -3, userInfo: [NSLocalizedDescriptionKey: "Timeout BLE"]))
     }
 

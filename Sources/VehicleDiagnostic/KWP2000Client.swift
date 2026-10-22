@@ -116,6 +116,7 @@ public actor KWP2000Client {
             stopTesterPresent()
         }
 
+        VehicleLogger.shared.info(.diagnostic, "KWP2000 StartDiagnosticSession (0x10) active: mode 0x\(hexMode)")
         return cleanResponse
     }
 
